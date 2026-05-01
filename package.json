@@ -1,0 +1,51 @@
+{
+  "name": "codex-eclaw-bridge",
+  "version": "0.1.0",
+  "description": "Persistent Codex app-server bridge for EClawbot Channel API.",
+  "type": "module",
+  "main": "dist/src/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/src/server.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "smoke:local": "tsx scripts/smoke-local.ts",
+    "smoke:live": "tsx scripts/smoke-live.ts",
+    "generate:codex-types": "codex app-server generate-ts --experimental --out src/codex-protocol"
+  },
+  "keywords": [
+    "codex",
+    "eclaw",
+    "eclawbot",
+    "bridge",
+    "channel-api",
+    "agent"
+  ],
+  "author": "HankHuang0516",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.19.2",
+    "nanoid": "^5.0.7",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.5",
+    "@types/supertest": "^6.0.2",
+    "@types/ws": "^8.5.13",
+    "eslint": "^9.17.0",
+    "supertest": "^7.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.2",
+    "vitest": "^4.1.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

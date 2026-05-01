@@ -1,0 +1,11 @@
+services:
+  codex-eclaw-bridge:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "18800:18800"
+    volumes:
+      - ./.data:/app/.data
+      - ${CODEX_WORKSPACE:-.}:${CODEX_WORKSPACE:-/workspace}
+    restart: unless-stopped
