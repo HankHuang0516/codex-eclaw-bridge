@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import request from "supertest";
-import { createApp } from "../src/server.js";
+import { buildStatusHeartbeatMessage, createApp, sendStatusHeartbeat } from "../src/server.js";
 import type { BridgeAppDeps } from "../src/server.js";
 import type { BridgeConfig } from "../src/types.js";
 
@@ -20,6 +20,8 @@ const config: BridgeConfig = {
   bridgeApprovalTimeoutMs: 1000,
   bridgeSendBusyUpdates: false,
   bridgeRequireCallbackAuth: false,
+  bridgeStatusHeartbeatEnabled: true,
+  bridgeStatusHeartbeatMs: 180000,
 };
 
 function deps(): BridgeAppDeps {
@@ -81,6 +83,96 @@ describe("server", () => {
 
     expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
     expect(d.eclaw.sendMessage).toHaveBeenCalled();
+  });
+
+  it("sends a rich model picker for /model without args", async () => {
+    const d = deps();
+    const app = createApp(d);
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({ deviceId: "dev", entityId: 1, text: "/model" })
+      .expect(200);
+
+    expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining("Choose the Codex model"),
+        expect.objectContaining({
+          card: expect.objectContaining({
+            ask_id: "codex_model_picker",
+            buttons: expect.arrayContaining([
+              expect.objectContaining({ id: "model:gpt-5.4-mini" }),
+            ]),
+          }),
+        }),
+      );
+    });
+  });
+
+  it("applies model picker card actions and resets the thread", async () => {
+    const d = deps();
+    const app = createApp(d);
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({
+        event: "card_action",
+        deviceId: "dev",
+        entityId: 1,
+        ask_id: "codex_model_picker",
+        action_id: "model:gpt-5.4-mini",
+      })
+      .expect(200);
+
+    expect(d.stateStore.write).toHaveBeenCalledWith({ model: "gpt-5.4-mini" });
+    expect(d.sessionManager.reset).toHaveBeenCalled();
+    expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        "Codex model set to gpt-5.4-mini. New turns will use a fresh thread.",
+      );
+    });
+  });
+
+  it("formats status heartbeat diagnostics", () => {
+    const message = buildStatusHeartbeatMessage({
+      session: {
+        activeTurnId: "turn_1",
+        activeThreadId: "thread_1",
+        activePrompt: "Run QA sweep",
+        activeElapsedMs: 7 * 60_000,
+        lastActivityAt: "2026-05-01T10:00:00.000Z",
+        lastEvent: "item:command",
+        bufferedChars: 0,
+      },
+      approvals: { pending: 0, askIds: [] },
+      codex: { connected: true },
+    });
+
+    expect(message).toContain("Codex status heartbeat");
+    expect(message).toContain("Task: Run QA sweep");
+    expect(message).toContain("Elapsed: 7m 0s");
+    expect(message).toContain("Approvals: no pending approval");
+  });
+
+  it("sends heartbeat only while a turn is active", async () => {
+    const d = deps();
+    d.sessionManager.status = () => ({
+      activeTurnId: "turn_1",
+      activeThreadId: "thread_1",
+      activePrompt: "Run QA sweep",
+      activeElapsedMs: 120000,
+      bufferedChars: 0,
+    });
+    d.approvalRouter.status = () => ({ pending: 1, askIds: ["ask_1"] });
+
+    await expect(sendStatusHeartbeat(d)).resolves.toBe(true);
+    expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("pending approval(s): ask_1"),
+      { busy: true },
+    );
   });
 
   it("supports local /ask diagnostics without sending to EClaw", async () => {

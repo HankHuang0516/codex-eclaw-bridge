@@ -42,6 +42,7 @@ describe("payload helpers", () => {
 
   it("parses bridge commands", () => {
     expect(parseBridgeCommand("/model gpt-5.4")).toEqual({ name: "model", args: "gpt-5.4" });
+    expect(parseBridgeCommand("/模型")).toEqual({ name: "model", args: "" });
     expect(isBridgeCommand("!codex status")).toBe(true);
     expect(parseBridgeCommand("!codex model gpt-5.4-mini")).toEqual({ name: "model", args: "gpt-5.4-mini" });
     expect(parseBridgeCommand("!codex")).toEqual({ name: "status", args: "" });

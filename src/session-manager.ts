@@ -16,6 +16,10 @@ type ActiveTurn = {
   threadId: string;
   turnId?: string;
   text: string;
+  prompt: string;
+  startedAt: number;
+  lastActivityAt: number;
+  lastEvent?: string;
   resolve: (text: string) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
@@ -37,6 +41,7 @@ export class SessionManager {
 
   async ensureThread(): Promise<string> {
     const state = await this.stateStore.read();
+    const baseInstructions = await this.baseInstructions(state);
     if (state.threadId) {
       if (!this.resumedThreads.has(state.threadId)) {
         try {
@@ -46,7 +51,7 @@ export class SessionManager {
             model: state.model ?? this.config.codexModel ?? null,
             approvalPolicy: this.config.codexApprovalPolicy,
             sandbox: this.config.codexSandbox,
-            baseInstructions: this.baseInstructions(),
+            baseInstructions,
             excludeTurns: true,
             persistExtendedHistory: true,
           });
@@ -64,7 +69,7 @@ export class SessionManager {
       model: state.model ?? this.config.codexModel ?? null,
       approvalPolicy: this.config.codexApprovalPolicy,
       sandbox: this.config.codexSandbox,
-      baseInstructions: this.baseInstructions(),
+      baseInstructions,
       experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
@@ -84,7 +89,7 @@ export class SessionManager {
     }
     const state = await this.stateStore.read();
     const threadId = await this.ensureThread();
-    const turnPromise = this.waitForTurn(threadId);
+    const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
     if (this.config.bridgeSendBusyUpdates) {
       await this.eclaw.sendMessage(state, "Codex is working...", { busy: true }).catch(() => undefined);
     }
@@ -102,6 +107,7 @@ export class SessionManager {
       if (!turnId) throw new Error("Codex turn/start did not return a turn id.");
       const activeAfterStart = this.activeTurn as ActiveTurn | undefined;
       if (activeAfterStart) activeAfterStart.turnId = turnId;
+      this.markActive("turn/start");
       await this.stateStore.write({ activeTurnId: turnId });
       return await turnPromise;
     } catch (err) {
@@ -139,22 +145,49 @@ export class SessionManager {
     return this.stateStore.clearThread();
   }
 
-  status(): { activeTurnId?: string; activeThreadId?: string; bufferedChars: number; lastTurnError?: string } {
+  status(): {
+    activeTurnId?: string;
+    activeThreadId?: string;
+    activePrompt?: string;
+    activeStartedAt?: string;
+    activeElapsedMs?: number;
+    lastActivityAt?: string;
+    lastEvent?: string;
+    bufferedChars: number;
+    lastTurnError?: string;
+  } {
+    const now = Date.now();
     return {
       activeTurnId: this.activeTurn?.turnId,
       activeThreadId: this.activeTurn?.threadId,
+      activePrompt: this.activeTurn?.prompt,
+      activeStartedAt: this.activeTurn ? new Date(this.activeTurn.startedAt).toISOString() : undefined,
+      activeElapsedMs: this.activeTurn ? now - this.activeTurn.startedAt : undefined,
+      lastActivityAt: this.activeTurn ? new Date(this.activeTurn.lastActivityAt).toISOString() : undefined,
+      lastEvent: this.activeTurn?.lastEvent,
       bufferedChars: this.activeTurn?.text.length ?? 0,
       lastTurnError: this.lastTurnError,
     };
   }
 
-  private waitForTurn(threadId: string): Promise<string> {
+  private waitForTurn(threadId: string, prompt: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.activeTurn = undefined;
         reject(new Error("Codex reply timed out."));
       }, this.config.bridgeReplyTimeoutMs);
-      this.activeTurn = { threadId, text: "", resolve, reject, timer };
+      const now = Date.now();
+      this.activeTurn = {
+        threadId,
+        text: "",
+        prompt: summarizePromptForStatus(prompt),
+        startedAt: now,
+        lastActivityAt: now,
+        lastEvent: "turn/queued",
+        resolve,
+        reject,
+        timer,
+      };
     });
   }
 
@@ -166,18 +199,21 @@ export class SessionManager {
 
     if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
       this.activeTurn.text += params.delta;
+      this.markActive(message.method);
       return;
     }
 
     if (message.method === "item/completed") {
       const text = this.extractAgentMessage(params.item);
       if (text) this.activeTurn.text = text;
+      this.markActive(describeItemEvent(params.item, message.method));
       return;
     }
 
     if (message.method === "rawResponseItem/completed") {
       const text = this.extractRawResponseText(params.item);
       if (text) this.activeTurn.text = text;
+      this.markActive(describeItemEvent(params.item, message.method));
       return;
     }
 
@@ -190,6 +226,12 @@ export class SessionManager {
       this.stateStore.write({ activeTurnId: undefined }).catch(() => undefined);
       this.activeTurn = undefined;
     }
+  }
+
+  private markActive(event: string): void {
+    if (!this.activeTurn) return;
+    this.activeTurn.lastActivityAt = Date.now();
+    this.activeTurn.lastEvent = event;
   }
 
   private extractFinalText(params: Record<string, any>): string {
@@ -226,17 +268,40 @@ export class SessionManager {
       .trim();
   }
 
-  private baseInstructions(): string {
-    return [
+  private async baseInstructions(state: BridgeState): Promise<string> {
+    const localInstructions = [
       "You are Codex connected to EClawbot through a channel bridge.",
       "EClaw users only see final replies sent by the bridge; they do not see terminal output.",
       "When the user asks for code work, inspect the repository, make changes, run verification, and summarize the result.",
+      "For long-running work, first send a short test plan/status outline before deep execution.",
+      "While working through a long task, provide concise progress updates after meaningful milestones, including what step you are on, the last command or tool action, and whether you are blocked.",
+      "If you are blocked by approval, a tool error, a pending command, quota, or missing context, say that explicitly instead of staying silent.",
       "Keep final replies concise and user-facing.",
       "Never reveal API keys, secrets, auth tokens, or private device credentials.",
     ].join("\n");
+
+    const remotePolicy = await this.eclaw.getPromptPolicy(state, "codex").catch(() => null);
+    const compiledPrompt = remotePolicy?.policy?.compiledPrompt?.trim();
+    if (!compiledPrompt) return localInstructions;
+
+    return [
+      localInstructions,
+      "The following EClaw backend prompt policy is centrally managed and applies to this entity/channel:",
+      compiledPrompt,
+    ].join("\n\n");
   }
 }
 
 function isMissingThreadError(err: unknown): boolean {
   return err instanceof Error && /thread not found/i.test(err.message);
+}
+
+function summarizePromptForStatus(text: string): string {
+  return text.trim().replace(/\s+/g, " ").slice(0, 120);
+}
+
+function describeItemEvent(item: any, fallback: string): string {
+  if (item?.type) return `item:${item.type}`;
+  if (item?.name) return `item:${item.name}`;
+  return fallback;
 }

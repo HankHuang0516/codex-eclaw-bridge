@@ -19,6 +19,8 @@ const config: BridgeConfig = {
   bridgeApprovalTimeoutMs: 1000,
   bridgeSendBusyUpdates: false,
   bridgeRequireCallbackAuth: false,
+  bridgeStatusHeartbeatEnabled: true,
+  bridgeStatusHeartbeatMs: 180000,
 };
 
 describe("EClawClient", () => {
@@ -43,5 +45,25 @@ describe("EClawClient", () => {
         message: "hello",
       }),
     }));
+  });
+
+  it("fetches centrally managed prompt policy for the bound entity", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, policy: { compiledPrompt: "central policy" } }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EClawClient(config);
+    const policy = await client.getPromptPolicy({ deviceId: "dev", entityId: 2, botSecret: "secret" }, "codex");
+
+    expect(policy?.policy?.compiledPrompt).toBe("central policy");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://eclawbot.com/api/channel/prompt-policy?deviceId=dev&entityId=2&botSecret=secret&channel=codex",
+      expect.objectContaining({
+        method: "GET",
+        body: undefined,
+      }),
+    );
   });
 });

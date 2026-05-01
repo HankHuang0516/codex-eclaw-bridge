@@ -7,7 +7,15 @@ import { ApprovalRouter } from "./approval-router.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
 import { SessionManager } from "./session-manager.js";
 import { StateStore } from "./state-store.js";
-import type { BridgeConfig, EClawInboundPayload } from "./types.js";
+import type { BridgeConfig, EClawCard, EClawInboundPayload } from "./types.js";
+
+const MODEL_PICKER_ASK_ID = "codex_model_picker";
+const MODEL_OPTIONS = [
+  { id: "gpt-5.5", label: "GPT-5.5", style: "primary" },
+  { id: "gpt-5.4", label: "GPT-5.4", style: "secondary" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", style: "secondary" },
+  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex", style: "secondary" },
+] as const;
 
 export type BridgeAppDeps = {
   config: BridgeConfig;
@@ -63,6 +71,10 @@ export function createApp(deps: BridgeAppDeps): express.Express {
 
       if (deps.approvalRouter.resolveFromPayload(payload)) {
         res.json({ success: true, handled: "approval" });
+        return;
+      }
+      if (await handleModelPickerAction(deps, payload)) {
+        res.json({ success: true, handled: "model_picker" });
         return;
       }
 
@@ -123,18 +135,72 @@ export async function bootstrap(): Promise<void> {
   await registerAndBind(eclaw, stateStore);
 
   const app = createApp({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
+  const heartbeat = startStatusHeartbeat({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
   app.listen(config.eclawWebhookPort, () => {
     console.log(`[bridge] listening on http://localhost:${config.eclawWebhookPort}`);
     console.log(`[bridge] public webhook: ${config.eclawWebhookUrl}/eclaw-webhook`);
   });
 
   const shutdown = async (): Promise<void> => {
+    if (heartbeat) clearInterval(heartbeat);
     await eclaw.unregisterCallback().catch(() => undefined);
     await codex.stop();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+export function startStatusHeartbeat(deps: BridgeAppDeps): NodeJS.Timeout | undefined {
+  if (!deps.config.bridgeStatusHeartbeatEnabled) return undefined;
+  const timer = setInterval(() => {
+    sendStatusHeartbeat(deps).catch((err) => console.error("[bridge] status heartbeat failed:", err.message));
+  }, deps.config.bridgeStatusHeartbeatMs);
+  timer.unref?.();
+  return timer;
+}
+
+export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean> {
+  const session = deps.sessionManager.status();
+  if (!session.activeTurnId && !session.activeThreadId) return false;
+
+  const state = await deps.stateStore.read();
+  const message = buildStatusHeartbeatMessage({
+    session,
+    approvals: deps.approvalRouter.status(),
+    codex: deps.codex.status(),
+  });
+  await deps.eclaw.sendMessage(state, message, { busy: true });
+  return true;
+}
+
+export function buildStatusHeartbeatMessage(status: {
+  session: ReturnType<SessionManager["status"]>;
+  approvals: ReturnType<ApprovalRouter["status"]>;
+  codex: ReturnType<CodexClient["status"]>;
+}): string {
+  const elapsed = formatElapsed(status.session.activeElapsedMs ?? 0);
+  const prompt = status.session.activePrompt || "(unknown task)";
+  const pendingApprovals = status.approvals.pending > 0
+    ? `${status.approvals.pending} pending approval(s): ${status.approvals.askIds.join(", ")}`
+    : "no pending approval";
+  return [
+    "Codex status heartbeat",
+    `- Task: ${prompt}`,
+    `- Elapsed: ${elapsed}`,
+    `- Last event: ${status.session.lastEvent ?? "turn started"}`,
+    `- Last activity: ${status.session.lastActivityAt ?? "(unknown)"}`,
+    `- Approvals: ${pendingApprovals}`,
+    `- Codex connected: ${status.codex.connected}`,
+  ].join("\n");
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds}s`;
 }
 
 export async function registerAndBind(eclaw: EClawClient, stateStore: StateStore): Promise<void> {
@@ -151,6 +217,7 @@ export async function registerAndBind(eclaw: EClawClient, stateStore: StateStore
 
 export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawInboundPayload): Promise<void> {
   if (deps.approvalRouter.resolveFromPayload(payload)) return;
+  if (await handleModelPickerAction(deps, payload)) return;
 
   const text = payload.text ?? "";
   if (isBridgeCommand(text)) {
@@ -196,12 +263,57 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
   }
   if (command.name === "model") {
     if (!command.args) {
-      await deps.eclaw.sendMessage(state, `Current model: ${state.model ?? deps.config.codexModel ?? "(default)"}`);
+      await deps.eclaw.sendMessage(state, modelPickerBody(state.model ?? deps.config.codexModel), {
+        card: modelPickerCard(state.model ?? deps.config.codexModel),
+      });
       return;
     }
-    await deps.stateStore.write({ model: command.args });
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${command.args}.`);
+    await setCodexModel(deps, command.args);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${command.args}. New turns will use a fresh thread.`);
   }
+}
+
+async function handleModelPickerAction(deps: BridgeAppDeps, payload: EClawInboundPayload): Promise<boolean> {
+  if (payload.event !== "card_action") return false;
+  if (payload.ask_id !== MODEL_PICKER_ASK_ID) return false;
+  const actionId = payload.action_id ?? "";
+  if (!actionId.startsWith("model:")) return false;
+
+  const model = actionId.slice("model:".length).trim();
+  if (!MODEL_OPTIONS.some((option) => option.id === model)) {
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`);
+    return true;
+  }
+  await setCodexModel(deps, model);
+  await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`);
+  return true;
+}
+
+async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<void> {
+  await deps.stateStore.write({ model });
+  await deps.sessionManager.reset();
+}
+
+function modelPickerBody(currentModel?: string): string {
+  return [
+    "Choose the Codex model for future turns.",
+    `Current model: ${currentModel ?? "(default)"}`,
+    "",
+    "You can also type `!codex model <name>` to use a custom model.",
+  ].join("\n");
+}
+
+function modelPickerCard(currentModel?: string): EClawCard {
+  return {
+    ask_id: MODEL_PICKER_ASK_ID,
+    title: "Codex model",
+    body: `Current: ${currentModel ?? "(default)"}`,
+    buttons: MODEL_OPTIONS.map((option) => ({
+      id: `model:${option.id}`,
+      label: option.label,
+      style: option.style,
+    })),
+  };
 }
 
 function verifyCallbackAuth(config: BridgeConfig) {

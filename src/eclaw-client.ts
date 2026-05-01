@@ -3,6 +3,7 @@ import type {
   BridgeState,
   ChannelBindResponse,
   ChannelMessageResponse,
+  ChannelPromptPolicyResponse,
   ChannelRegisterResponse,
   EClawCard,
 } from "./types.js";
@@ -48,6 +49,19 @@ export class EClawClient {
       ...(options.card && { card: options.card }),
     };
     return this.post<ChannelMessageResponse>("/api/channel/message", body);
+  }
+
+  async getPromptPolicy(state: BridgeState, channel = "codex"): Promise<ChannelPromptPolicyResponse | null> {
+    if (!state.deviceId || state.entityId === undefined || !state.botSecret) return null;
+    const params = new URLSearchParams({
+      deviceId: state.deviceId,
+      entityId: String(state.entityId),
+      botSecret: state.botSecret,
+      channel,
+    });
+    return this.request<ChannelPromptPolicyResponse>(`/api/channel/prompt-policy?${params.toString()}`, {
+      method: "GET",
+    });
   }
 
   async unregisterCallback(): Promise<void> {
