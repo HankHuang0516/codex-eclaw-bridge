@@ -109,7 +109,9 @@ export class SessionManager {
       if (activeAfterStart) activeAfterStart.turnId = turnId;
       this.markActive("turn/start");
       await this.stateStore.write({ activeTurnId: turnId });
-      return await turnPromise;
+      const reply = await turnPromise;
+      await this.sendStopProgressUpdateIfRequired(state, reply);
+      return reply;
     } catch (err) {
       const activeAfterError = this.activeTurn as ActiveTurn | undefined;
       if (activeAfterError) {
@@ -290,6 +292,32 @@ export class SessionManager {
       compiledPrompt,
     ].join("\n\n");
   }
+
+  private async sendStopProgressUpdateIfRequired(state: BridgeState, reply: string): Promise<void> {
+    const remotePolicy = await this.eclaw.getPromptPolicy(state, "codex").catch(() => null);
+    const compiledPrompt = remotePolicy?.policy?.compiledPrompt ?? "";
+    if (!requiresStopProgressTransform(compiledPrompt)) return;
+
+    const summary = summarizePromptForStatus(reply || "Final reply ready.");
+    await this.eclaw.sendMessage(
+      state,
+      [
+        "EClaw progress update",
+        `目前進度：本輪任務已完成，正在送出最終回覆。${summary ? `摘要：${summary}` : ""}`,
+        "阻塞點：無。",
+        "下一步：等待下一個指令。",
+      ].join("\n"),
+      { busy: true },
+    ).catch(() => undefined);
+  }
+}
+
+export function requiresStopProgressTransform(compiledPrompt: string): boolean {
+  const text = compiledPrompt.toLowerCase();
+  return (
+    text.includes("transform api") &&
+    (text.includes("停下手邊工作前") || text.includes("before stopping") || text.includes("before final"))
+  );
 }
 
 function isMissingThreadError(err: unknown): boolean {
