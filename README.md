@@ -110,6 +110,8 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `BRIDGE_REPLY_TIMEOUT_MS` |  | `600000` | Turn reply timeout |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` |  | `900000` | Approval card timeout |
 | `BRIDGE_SEND_BUSY_UPDATES` |  | `false` | Send a persistent "working" message before turns |
+| `BRIDGE_STATUS_HEARTBEAT_ENABLED` |  | `true` | Send periodic long-task status updates while a Codex turn is active |
+| `BRIDGE_STATUS_HEARTBEAT_MS` |  | `180000` | Status heartbeat interval |
 | `BRIDGE_REQUIRE_CALLBACK_AUTH` |  | `false` | Require configured callback auth |
 
 Never commit `.env`. `.gitignore` excludes `.env*` except `.env.example`.
@@ -124,10 +126,40 @@ Send these directly in the EClaw chat:
 | `!codex reset` | Archive current Codex thread and start fresh on the next message |
 | `!codex interrupt` | Interrupt the active Codex turn |
 | `!codex model <name>` | Use a different model for subsequent turns |
+| `/model` or `/模型` | Show an EClaw rich card model picker |
 
 The bridge also accepts `/status`, `/reset`, `/interrupt`, and `/model` on
-direct webhook calls, but EClawbot's app/portal reserves some slash commands for
-platform actions. For real EClaw chat, use the `!codex ...` form.
+direct webhook calls. `/model` is safe in EClaw chat because the bridge responds
+with a model picker card; for other commands, prefer `!codex ...` to avoid
+conflicts with EClaw built-in platform actions.
+
+## Long-Running Task Visibility
+
+The bridge has two layers of progress visibility:
+
+1. Codex task protocol instructions tell Codex to start long work with a short
+   test plan and report meaningful milestones instead of only sending a final
+   answer.
+2. The bridge sends an external status heartbeat while a Codex turn is active.
+   This heartbeat does not rely on Codex choosing to speak; it reports the
+   active task summary, elapsed time, last observed Codex event, connection
+   state, and whether any approval cards are pending.
+
+Default heartbeat interval is 3 minutes. Tune it with
+`BRIDGE_STATUS_HEARTBEAT_MS`, or disable it with
+`BRIDGE_STATUS_HEARTBEAT_ENABLED=false`.
+
+## Central Prompt Policy
+
+When the bound EClaw backend supports `/api/channel/prompt-policy`, the bridge
+fetches the composed Codex policy before starting or resuming a thread. The
+central policy is appended after the bridge's local safety and task-protocol
+fallback instructions, so the bridge still works if the endpoint is unavailable.
+
+Manage device-level policy in EClaw Portal Settings > Developer > Agent Policy.
+Entity-level policy can be stored in `identity.promptPolicy` through the EClaw
+prompt-policy API and is merged with device policy and channel overrides at
+runtime.
 
 ## Approval Flow
 

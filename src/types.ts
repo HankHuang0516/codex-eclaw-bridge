@@ -21,6 +21,8 @@ export type BridgeConfig = {
   bridgeApprovalTimeoutMs: number;
   bridgeSendBusyUpdates: boolean;
   bridgeRequireCallbackAuth: boolean;
+  bridgeStatusHeartbeatEnabled: boolean;
+  bridgeStatusHeartbeatMs: number;
 };
 
 export type BridgeState = {
@@ -97,6 +99,30 @@ export type ChannelMessageResponse = {
   delivered?: boolean;
   warnings?: string[];
   [key: string]: unknown;
+};
+
+export type ChannelPromptPolicyResponse = {
+  success: boolean;
+  policy?: {
+    version?: number;
+    channel?: string;
+    taskProtocol?: {
+      requireTestPlan?: boolean;
+      requireMilestoneUpdates?: boolean;
+      statusHeartbeatMs?: number;
+      [key: string]: unknown;
+    };
+    sections?: Array<{
+      scope: string;
+      title: string;
+      content: string;
+    }>;
+    compiledPrompt?: string;
+    [key: string]: unknown;
+  };
+  devicePolicy?: unknown;
+  entityPolicy?: unknown;
+  message?: string;
 };
 
 export type EClawCard = {
