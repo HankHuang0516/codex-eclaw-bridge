@@ -56,6 +56,14 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     this.pending.clear();
     this.ws?.close();
     this.proc?.kill("SIGTERM");
+    this.ws = undefined;
+    this.proc = undefined;
+    this.endpoint = undefined;
+  }
+
+  async restart(): Promise<void> {
+    await this.stop().catch(() => undefined);
+    await this.start();
   }
 
   async request<T = unknown>(method: string, params?: unknown, timeoutMs = 60_000): Promise<T> {

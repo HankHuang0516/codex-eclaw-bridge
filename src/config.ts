@@ -28,6 +28,8 @@ const envSchema = z.object({
   BRIDGE_REQUIRE_CALLBACK_AUTH: z.coerce.boolean().default(false),
   BRIDGE_STATUS_HEARTBEAT_ENABLED: z.coerce.boolean().default(true),
   BRIDGE_STATUS_HEARTBEAT_MS: z.coerce.number().int().positive().default(180_000),
+  BRIDGE_WATCHDOG_ENABLED: z.coerce.boolean().default(true),
+  BRIDGE_WATCHDOG_STALL_MS: z.coerce.number().int().positive().default(480_000),
 });
 
 function emptyToUndefined(value: string | undefined): string | undefined {
@@ -65,5 +67,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     bridgeRequireCallbackAuth: parsed.BRIDGE_REQUIRE_CALLBACK_AUTH,
     bridgeStatusHeartbeatEnabled: parsed.BRIDGE_STATUS_HEARTBEAT_ENABLED,
     bridgeStatusHeartbeatMs: parsed.BRIDGE_STATUS_HEARTBEAT_MS,
+    bridgeWatchdogEnabled: parsed.BRIDGE_WATCHDOG_ENABLED,
+    bridgeWatchdogStallMs: parsed.BRIDGE_WATCHDOG_STALL_MS,
   };
 }

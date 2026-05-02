@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatInboundForCodex, isBridgeCommand, parseBridgeCommand, shouldIgnoreInbound } from "../src/payload.js";
+import { formatInboundForCodex, isBridgeCommand, parseBridgeCommand, sanitizeInboundTextForCodex, shouldIgnoreInbound } from "../src/payload.js";
 
 describe("payload helpers", () => {
   it("ignores silent token messages", () => {
@@ -61,5 +61,25 @@ describe("payload helpers", () => {
 
     expect(prompt.match(/\[AVAILABLE TOOLS/g)).toHaveLength(1);
     expect(prompt).not.toContain("Mission/API hints from EClaw:");
+  });
+
+  it("removes EClaw local variables marker before sending text to Codex", () => {
+    const text = [
+      "please investigate #6",
+      "",
+      "[Local Variables available: GIT_HUB2, OPENAI_API_KEY]",
+      "exec: curl -s \"https://eclawbot.com/api/device-vars?deviceId=dev&botSecret=secret\"",
+    ].join("\n");
+
+    const sanitized = sanitizeInboundTextForCodex(text);
+    expect(sanitized.removedLocalVariablesHint).toBe(true);
+    expect(sanitized.text).toContain("please investigate #6");
+    expect(sanitized.text).not.toContain("[Local Variables available");
+    expect(sanitized.text).not.toContain("botSecret=secret");
+
+    const prompt = formatInboundForCodex({ deviceId: "dev", entityId: 6, text });
+    expect(prompt).toContain("EClaw vault context:");
+    expect(prompt).not.toContain("[Local Variables available");
+    expect(prompt).not.toContain("botSecret=secret");
   });
 });

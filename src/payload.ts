@@ -18,6 +18,8 @@ export function shouldIgnoreInbound(payload: EClawInboundPayload): { ignore: boo
 }
 
 export function formatInboundForCodex(payload: EClawInboundPayload): string {
+  const text = payload.text ?? "";
+  const sanitized = sanitizeInboundTextForCodex(text);
   const lines = [
     "You received an EClawbot channel message.",
     "",
@@ -32,13 +34,31 @@ export function formatInboundForCodex(payload: EClawInboundPayload): string {
   ];
   if (payload.fromEntityId !== undefined) lines.push(`- fromEntityId: ${payload.fromEntityId}`);
   if (payload.fromCharacter) lines.push(`- fromCharacter: ${payload.fromCharacter}`);
-  const text = payload.text ?? "";
-  const hasInlinedMissionHints = payload.contextInlined || text.includes("[AVAILABLE TOOLS");
+  const hasInlinedMissionHints = payload.contextInlined || sanitized.text.includes("[AVAILABLE TOOLS");
   if (payload.eclaw_context?.missionHints && !hasInlinedMissionHints) {
     lines.push("", "Mission/API hints from EClaw:", payload.eclaw_context.missionHints);
   }
-  lines.push("", "User message:", text);
+  if (sanitized.removedLocalVariablesHint) {
+    lines.push(
+      "",
+      "EClaw vault context:",
+      "The platform attached a local-vault availability hint to this message. The bridge removed that reserved marker before sending the turn to Codex. Do not reveal secrets; ask the user before reading device variables.",
+    );
+  }
+  lines.push("", "User message:", sanitized.text);
   return lines.join("\n");
+}
+
+export function sanitizeInboundTextForCodex(text: string): { text: string; removedLocalVariablesHint: boolean } {
+  let removedLocalVariablesHint = false;
+  const sanitized = text.replace(
+    /\n{0,2}\[Local Variables available:[^\n]*\](?:\n(?:Note:[^\n]*|exec:[^\n]*))*\s*/gi,
+    () => {
+      removedLocalVariablesHint = true;
+      return "\n\nEClaw vault hint removed by bridge watchdog.\n";
+    },
+  ).trim();
+  return { text: sanitized, removedLocalVariablesHint };
 }
 
 export function isBridgeCommand(text: string): boolean {

@@ -136,6 +136,7 @@ export async function bootstrap(): Promise<void> {
 
   const app = createApp({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
   const heartbeat = startStatusHeartbeat({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
+  const watchdog = startWatchdog({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
   app.listen(config.eclawWebhookPort, () => {
     console.log(`[bridge] listening on http://localhost:${config.eclawWebhookPort}`);
     console.log(`[bridge] public webhook: ${config.eclawWebhookUrl}/eclaw-webhook`);
@@ -143,6 +144,7 @@ export async function bootstrap(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     if (heartbeat) clearInterval(heartbeat);
+    if (watchdog) clearInterval(watchdog);
     await eclaw.unregisterCallback().catch(() => undefined);
     await codex.stop();
     process.exit(0);
@@ -158,6 +160,40 @@ export function startStatusHeartbeat(deps: BridgeAppDeps): NodeJS.Timeout | unde
   }, deps.config.bridgeStatusHeartbeatMs);
   timer.unref?.();
   return timer;
+}
+
+export function startWatchdog(deps: BridgeAppDeps): NodeJS.Timeout | undefined {
+  if (!deps.config.bridgeWatchdogEnabled) return undefined;
+  const intervalMs = Math.max(30_000, Math.min(deps.config.bridgeWatchdogStallMs / 2, 120_000));
+  const timer = setInterval(() => {
+    runWatchdog(deps).catch((err) => console.error("[bridge] watchdog failed:", err.message));
+  }, intervalMs);
+  timer.unref?.();
+  return timer;
+}
+
+export async function runWatchdog(deps: BridgeAppDeps): Promise<boolean> {
+  if (!deps.codex.status().connected) {
+    await deps.codex.restart();
+    const state = await deps.stateStore.read();
+    await deps.eclaw.sendMessage(state, [
+      "Codex watchdog self-repair",
+      "- Trigger: app-server websocket disconnected.",
+      "- Action: restarted Codex app-server.",
+    ].join("\n"), { busy: true }).catch(() => undefined);
+    return true;
+  }
+
+  const session = deps.sessionManager.status();
+  if (!session.activeThreadId) return false;
+  if (deps.approvalRouter.status().pending > 0) return false;
+  if (!session.lastActivityAt) return false;
+
+  const idleMs = Date.now() - Date.parse(session.lastActivityAt);
+  if (Number.isNaN(idleMs) || idleMs < deps.config.bridgeWatchdogStallMs) return false;
+
+  await deps.sessionManager.recoverStalledTurn(`No Codex activity for ${formatElapsed(idleMs)}.`);
+  return true;
 }
 
 export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean> {
@@ -234,7 +270,7 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
       await deps.eclaw.sendMessage(await deps.stateStore.read(), reply);
     }
   } catch (err: any) {
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Bridge error: ${err.message}`);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), formatBridgeError(err));
   }
 }
 
@@ -248,6 +284,8 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
       `- Thread: ${state.threadId ?? "(none)"}`,
       `- Active turn: ${deps.sessionManager.status().activeTurnId ?? "(none)"}`,
       `- Pending approvals: ${deps.approvalRouter.status().pending}`,
+      `- Last Codex error: ${deps.sessionManager.status().lastTurnError ?? "(none)"}`,
+      `- Watchdog: ${deps.config.bridgeWatchdogEnabled ? `enabled, stall ${formatElapsed(deps.config.bridgeWatchdogStallMs)}` : "disabled"}`,
     ].join("\n"));
     return;
   }
@@ -348,6 +386,21 @@ function safeEqual(a: string, b: string): boolean {
   const right = Buffer.from(b);
   if (left.length !== right.length) return false;
   return crypto.timingSafeEqual(left, right);
+}
+
+function formatBridgeError(err: any): string {
+  const raw = err?.message ? String(err.message) : "unknown bridge error";
+  const message = raw
+    .replace(/\b(eck|ecs)_[A-Za-z0-9_-]+/g, "$1_[redacted]")
+    .replace(/\b(?:deviceSecret|botSecret|token|password)=([^&\s]+)/gi, "$1=[redacted]")
+    .replace(/\s+/g, " ")
+    .slice(0, 300);
+  return [
+    "Codex bridge error",
+    `- Status: watchdog could not recover this turn automatically.`,
+    `- Reason: ${message}`,
+    "- Next: send `!codex status`, `!codex reset`, or retry the task.",
+  ].join("\n");
 }
 
 function redactState(state: Record<string, unknown>): Record<string, unknown> {
