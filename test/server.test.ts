@@ -132,7 +132,12 @@ describe("server", () => {
     });
   });
 
-  it("applies model picker card actions and resets the thread", async () => {
+  it.each([
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+  ])("applies %s model picker card actions and resets the thread", async (model) => {
     const d = deps();
     const app = createApp(d);
     await request(app)
@@ -142,17 +147,17 @@ describe("server", () => {
         deviceId: "dev",
         entityId: 1,
         ask_id: "codex_model_picker",
-        action_id: "model:gpt-5.4-mini",
+        action_id: `model:${model}`,
       })
       .expect(200);
 
-    expect(d.stateStore.write).toHaveBeenCalledWith({ model: "gpt-5.4-mini" });
+    expect(d.stateStore.write).toHaveBeenCalledWith({ model });
     expect(d.sessionManager.reset).toHaveBeenCalled();
     expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
     await vi.waitFor(() => {
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
-        "Codex model set to gpt-5.4-mini. New turns will use a fresh thread.",
+        `Codex model set to ${model}. New turns will use a fresh thread.`,
       );
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
