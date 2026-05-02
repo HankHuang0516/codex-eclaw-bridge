@@ -231,7 +231,11 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
   try {
     const reply = await deps.sessionManager.handleInbound(payload);
     if (reply.trim()) {
-      await deps.eclaw.sendMessage(await deps.stateStore.read(), reply);
+      // Use sendCodexReply so the captured senderHint from the inbound is
+      // forwarded to /api/channel/message (EClaw#2285 Phase 3b). For
+      // operational messages (errors), fall back to plain sendMessage so
+      // we don't accidentally route them to the original sender.
+      await deps.sessionManager.sendCodexReply(await deps.stateStore.read(), reply);
     }
   } catch (err: any) {
     await deps.eclaw.sendMessage(await deps.stateStore.read(), `Bridge error: ${err.message}`);
