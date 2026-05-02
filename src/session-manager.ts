@@ -110,7 +110,7 @@ export class SessionManager {
     const threadId = await this.ensureThread();
     const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
     if (this.config.bridgeSendBusyUpdates) {
-      await this.eclaw.sendMessage(state, "Codex is working...", { busy: true }).catch(() => undefined);
+      await this.eclaw.sendMessage(state, "Codex is working...", { busy: true, suppressA2A: true }).catch(() => undefined);
     }
     const input = formatInboundForCodex(payload);
     try {
@@ -369,7 +369,7 @@ export class SessionManager {
         "阻塞點：無。",
         "下一步：等待下一個指令。",
       ].join("\n"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     ).catch(() => undefined);
   }
 
@@ -402,7 +402,7 @@ export class SessionManager {
         "- Action: reset Codex thread/app-server state and retry once with sanitized EClaw metadata.",
         `- Task: ${summarizePromptForStatus(payload.text ?? "")}`,
       ].join("\n"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     ).catch(() => undefined);
     await this.stateStore.clearThread();
     this.resumedThreads.clear();

@@ -245,7 +245,7 @@ export async function runWatchdog(deps: BridgeAppDeps): Promise<boolean> {
       "Codex watchdog self-repair",
       "- Trigger: app-server websocket disconnected.",
       "- Action: restarted Codex app-server.",
-    ].join("\n"), { busy: true }).catch(() => undefined);
+    ].join("\n"), { busy: true, suppressA2A: true }).catch(() => undefined);
     return true;
   }
 
@@ -289,7 +289,7 @@ export async function runPublicWebhookWatchdog(deps: BridgeAppDeps): Promise<boo
       `- Previous URL: ${previousUrl}`,
       `- New URL: ${nextUrl}`,
       "- Action: restarted managed tunnel and re-registered EClaw callback.",
-    ].join("\n"), { busy: true }).catch(() => undefined);
+    ].join("\n"), { busy: true, suppressA2A: true }).catch(() => undefined);
     deps.publicWebhookMonitor.lastFailure = undefined;
     return true;
   }
@@ -304,7 +304,7 @@ export async function runPublicWebhookWatchdog(deps: BridgeAppDeps): Promise<boo
       `- URL: ${deps.config.eclawWebhookUrl}`,
       `- Reason: ${deps.publicWebhookMonitor.lastFailure}`,
       "- Action needed: restart the public tunnel or enable BRIDGE_MANAGED_TUNNEL_ENABLED=true.",
-    ].join("\n"), { busy: true }).catch(() => undefined);
+    ].join("\n"), { busy: true, suppressA2A: true }).catch(() => undefined);
   }
 
   return false;
@@ -341,7 +341,7 @@ export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean>
     approvals: deps.approvalRouter.status(),
     codex: deps.codex.status(),
   });
-  await deps.eclaw.sendMessage(state, message, { busy: true });
+  await deps.eclaw.sendMessage(state, message, { busy: true, suppressA2A: true });
   return true;
 }
 
@@ -423,13 +423,27 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
   const ignore = shouldIgnoreInbound(payload);
   if (ignore.ignore) return;
 
+  const a2aInbound = isA2AInbound(payload);
+  if (a2aInbound && isOperationalA2AEcho(payload)) {
+    console.warn("[bridge] suppressed A2A operational echo.");
+    return;
+  }
+  if (a2aInbound && hasActiveCodexTurn(deps)) {
+    console.warn("[bridge] suppressed A2A inbound while Codex turn is active.");
+    return;
+  }
+
   try {
     const reply = await deps.sessionManager.handleInbound(payload);
     if (reply.trim()) {
       await deps.eclaw.sendMessage(await deps.stateStore.read(), reply);
     }
   } catch (err: any) {
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), formatBridgeError(err));
+    if (a2aInbound && isOperationalBridgeError(err)) {
+      console.warn(`[bridge] suppressed operational bridge error for A2A inbound: ${sanitizeHealthError(err)}`);
+      return;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), formatBridgeError(err), { suppressA2A: true });
   }
 }
 
@@ -447,17 +461,17 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
       `- Pending approvals: ${deps.approvalRouter.status().pending}`,
       `- Last Codex error: ${deps.sessionManager.status().lastTurnError ?? "(none)"}`,
       `- Watchdog: ${deps.config.bridgeWatchdogEnabled ? `enabled, stall ${formatElapsed(deps.config.bridgeWatchdogStallMs)}` : "disabled"}`,
-    ].join("\n"));
+    ].join("\n"), { suppressA2A: true });
     return;
   }
   if (command.name === "reset") {
     await deps.sessionManager.reset();
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), "Codex bridge thread reset.");
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), "Codex bridge thread reset.", { suppressA2A: true });
     return;
   }
   if (command.name === "interrupt") {
     const didInterrupt = await deps.sessionManager.interrupt();
-    await deps.eclaw.sendMessage(state, didInterrupt ? "Codex turn interrupted." : "No active Codex turn.");
+    await deps.eclaw.sendMessage(state, didInterrupt ? "Codex turn interrupted." : "No active Codex turn.", { suppressA2A: true });
     return;
   }
   if (command.name === "model") {
@@ -466,22 +480,25 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
     if (!command.args) {
       await deps.eclaw.sendMessage(state, modelPickerBody(currentModel), {
         card: modelPickerCard(currentModel),
+        suppressA2A: true,
       });
       await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
         card: reasoningPickerCard(currentEffort),
+        suppressA2A: true,
       });
       return;
     }
     const model = await setCodexModel(deps, command.args);
     if (!model) {
-      await deps.eclaw.sendMessage(state, "Invalid Codex model name. Use a short model id like `gpt-5.5`.");
+      await deps.eclaw.sendMessage(state, "Invalid Codex model name. Use a short model id like `gpt-5.5`.", { suppressA2A: true });
       return;
     }
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`, { suppressA2A: true });
     const nextState = await deps.stateStore.read();
     const nextEffort = currentReasoningEffort(nextState, deps.config);
     await deps.eclaw.sendMessage(nextState, reasoningPickerBody(nextEffort), {
       card: reasoningPickerCard(nextEffort),
+      suppressA2A: true,
     });
     return;
   }
@@ -490,15 +507,16 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
       const currentEffort = currentReasoningEffort(state, deps.config);
       await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
         card: reasoningPickerCard(currentEffort),
+        suppressA2A: true,
       });
       return;
     }
     const effort = await setCodexReasoningEffort(deps, command.args);
     if (!effort) {
-      await deps.eclaw.sendMessage(state, "Invalid Codex intelligence value. Use `low`, `medium`, `high`, `xhigh`, or `低` / `中` / `高` / `超高`.");
+      await deps.eclaw.sendMessage(state, "Invalid Codex intelligence value. Use `low`, `medium`, `high`, `xhigh`, or `低` / `中` / `高` / `超高`.", { suppressA2A: true });
       return;
     }
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(effort)} (${effort}). New turns will use a fresh thread.`);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(effort)} (${effort}). New turns will use a fresh thread.`, { suppressA2A: true });
     return;
   }
 }
@@ -511,15 +529,16 @@ async function handleModelPickerAction(deps: BridgeAppDeps, payload: EClawInboun
 
     const model = actionId.slice("model:".length).trim();
     if (!MODEL_OPTIONS.some((option) => option.id === model)) {
-      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`);
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`, { suppressA2A: true });
       return true;
     }
     const safeModel = await setCodexModel(deps, model);
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${safeModel}. New turns will use a fresh thread.`);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${safeModel}. New turns will use a fresh thread.`, { suppressA2A: true });
     const state = await deps.stateStore.read();
     const currentEffort = currentReasoningEffort(state, deps.config);
     await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
       card: reasoningPickerCard(currentEffort),
+      suppressA2A: true,
     });
     return true;
   }
@@ -528,15 +547,15 @@ async function handleModelPickerAction(deps: BridgeAppDeps, payload: EClawInboun
     if (!actionId.startsWith("effort:")) return false;
     const effort = actionId.slice("effort:".length).trim();
     if (!REASONING_OPTIONS.some((option) => option.id === effort)) {
-      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`);
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`, { suppressA2A: true });
       return true;
     }
     const safeEffort = await setCodexReasoningEffort(deps, effort);
     if (!safeEffort) {
-      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`);
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`, { suppressA2A: true });
       return true;
     }
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(safeEffort)} (${safeEffort}). New turns will use a fresh thread.`);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(safeEffort)} (${safeEffort}). New turns will use a fresh thread.`, { suppressA2A: true });
     return true;
   }
 
@@ -613,6 +632,39 @@ function reasoningLabel(effort?: string): string {
 
 function currentReasoningEffort(state: { reasoningEffort?: string }, config: BridgeConfig): string | undefined {
   return sanitizeCodexReasoningEffort(state.reasoningEffort) ?? sanitizeCodexReasoningEffort(config.codexReasoningEffort);
+}
+
+function isA2AInbound(payload: EClawInboundPayload): boolean {
+  if (payload.fromEntityId !== undefined && payload.fromEntityId !== null) return true;
+
+  const event = String(payload.event ?? "").toLowerCase();
+  if (["entity_message", "broadcast", "org_forward"].includes(event)) return true;
+
+  const from = String(payload.from ?? "").toLowerCase();
+  if (from.startsWith("entity:") || from.startsWith("xdevice:")) return true;
+
+  const text = payload.text ?? "";
+  return /^\[(bot-to-bot message|broadcast from|org forward)\b/i.test(text);
+}
+
+function hasActiveCodexTurn(deps: BridgeAppDeps): boolean {
+  const session = deps.sessionManager.status();
+  return !!(session.activeTurnId || session.activeThreadId);
+}
+
+function isOperationalA2AEcho(payload: EClawInboundPayload): boolean {
+  const text = payload.text ?? "";
+  return /\b(Codex bridge error|Bridge error|Codex status heartbeat|Codex heartbeat|Codex watchdog|watchdog self-repair)\b/i.test(text);
+}
+
+function isOperationalBridgeError(err: any): boolean {
+  const message = String(err?.message ?? err ?? "").toLowerCase();
+  return (
+    message.includes("still processing the previous message") ||
+    message.includes("codex reply timed out") ||
+    message.includes("codex app-server websocket") ||
+    message.includes("app-server websocket")
+  );
 }
 
 function verifyCallbackAuth(config: BridgeConfig) {

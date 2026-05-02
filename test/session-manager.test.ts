@@ -188,12 +188,12 @@ describe("SessionManager stop-progress enforcement", () => {
     expect(eclaw.sendMessage).toHaveBeenCalledWith(
       state,
       expect.stringContaining("EClaw progress update"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
     expect(eclaw.sendMessage).toHaveBeenCalledWith(
       state,
       expect.stringContaining("阻塞點：無。"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
   });
 
@@ -255,7 +255,7 @@ describe("SessionManager stop-progress enforcement", () => {
     expect(eclaw.sendMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("Codex watchdog self-repair"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
   });
 

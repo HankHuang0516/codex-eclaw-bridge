@@ -116,7 +116,53 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("- Intelligence: (default)"),
+      { suppressA2A: true },
     );
+  });
+
+  it("suppresses A2A inbound while a Codex turn is active", async () => {
+    const d = deps();
+    d.sessionManager.status = () => ({
+      activeTurnId: "turn_1",
+      activeThreadId: "thread_1",
+      bufferedChars: 0,
+    });
+    const app = createApp(d);
+
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({
+        event: "org_forward",
+        from: "entity:2",
+        fromEntityId: 2,
+        deviceId: "dev",
+        entityId: 1,
+        text: "@#6 Bridge error x3",
+      })
+      .expect(200);
+
+    expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
+    expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("suppresses A2A operational echoes even when Codex is idle", async () => {
+    const d = deps();
+    const app = createApp(d);
+
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({
+        event: "org_forward",
+        from: "entity:2",
+        fromEntityId: 2,
+        deviceId: "dev",
+        entityId: 1,
+        text: "@#6 Bridge error x8. Holding until Codex recovers.",
+      })
+      .expect(200);
+
+    expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
+    expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
   });
 
   it("sends rich model and intelligence pickers for /model without args", async () => {
@@ -186,6 +232,7 @@ describe("server", () => {
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
         `Codex model set to ${model}. New turns will use a fresh thread.`,
+        { suppressA2A: true },
       );
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
@@ -216,6 +263,7 @@ describe("server", () => {
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
         "Codex intelligence set to 高 (high). New turns will use a fresh thread.",
+        { suppressA2A: true },
       );
     });
   });
@@ -234,6 +282,7 @@ describe("server", () => {
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
         "Codex intelligence set to 超高 (xhigh). New turns will use a fresh thread.",
+        { suppressA2A: true },
       );
     });
   });
@@ -256,6 +305,7 @@ describe("server", () => {
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
         expect.stringContaining("Invalid Codex model name"),
+        { suppressA2A: true },
       );
     });
   });
@@ -323,7 +373,7 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("pending approval(s): ask_1"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
   });
 
@@ -336,7 +386,7 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("app-server websocket disconnected"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
   });
 
@@ -380,7 +430,7 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("restarted managed tunnel"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
   });
 
@@ -394,7 +444,7 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("public webhook health check failed"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     );
   });
 

@@ -56,6 +56,33 @@ describe("EClawClient", () => {
     }));
   });
 
+  it("can mark operational messages to suppress A2A routing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EClawClient(config);
+    await client.sendMessage({ deviceId: "dev", entityId: 2, botSecret: "secret" }, "Codex bridge status", {
+      busy: true,
+      suppressA2A: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("https://eclawbot.com/api/channel/message", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        channel_api_key: "eck_test",
+        deviceId: "dev",
+        entityId: 2,
+        botSecret: "secret",
+        state: "BUSY",
+        message: "Codex bridge status",
+        suppressA2A: true,
+      }),
+    }));
+  });
+
   it("fetches centrally managed prompt policy for the bound entity", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
