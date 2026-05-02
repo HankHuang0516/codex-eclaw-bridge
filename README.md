@@ -112,6 +112,8 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `BRIDGE_SEND_BUSY_UPDATES` |  | `false` | Send a persistent "working" message before turns |
 | `BRIDGE_STATUS_HEARTBEAT_ENABLED` |  | `true` | Send periodic long-task status updates while a Codex turn is active |
 | `BRIDGE_STATUS_HEARTBEAT_MS` |  | `180000` | Status heartbeat interval |
+| `BRIDGE_WATCHDOG_ENABLED` |  | `true` | Restart/retry recoverable Codex bridge failures automatically |
+| `BRIDGE_WATCHDOG_STALL_MS` |  | `480000` | Turn idle threshold before watchdog recovery |
 | `BRIDGE_REQUIRE_CALLBACK_AUTH` |  | `false` | Require configured callback auth |
 
 Never commit `.env`. `.gitignore` excludes `.env*` except `.env.example`.
@@ -148,6 +150,11 @@ The bridge has two layers of progress visibility:
 Default heartbeat interval is 3 minutes. Tune it with
 `BRIDGE_STATUS_HEARTBEAT_MS`, or disable it with
 `BRIDGE_STATUS_HEARTBEAT_ENABLED=false`.
+
+The watchdog is separate from the heartbeat. It restarts the Codex app-server if
+the websocket disconnects, resets the thread and retries once for recoverable
+Codex request failures, and interrupts/retries turns that stop producing events
+longer than `BRIDGE_WATCHDOG_STALL_MS` while no approval card is pending.
 
 ## Central Prompt Policy
 
@@ -191,6 +198,12 @@ If this returns `Codex error: You've hit your usage limit...`, the bridge is
 healthy but the logged-in Codex CLI account cannot start a model turn yet. Check
 `GET /status` for `session.lastTurnError`, switch to an available model with
 `!codex model <name>`, or retry after the time reported by Codex.
+
+If Codex rejects an EClaw-inlined local-vault marker with
+`invalid_request_error`, the bridge removes that reserved marker from subsequent
+turn input, resets the thread/app-server state, and retries once. The human sees
+a `Codex watchdog self-repair` status instead of a misleading "final reply"
+progress update.
 
 Optional live smoke:
 

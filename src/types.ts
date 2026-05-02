@@ -23,6 +23,8 @@ export type BridgeConfig = {
   bridgeRequireCallbackAuth: boolean;
   bridgeStatusHeartbeatEnabled: boolean;
   bridgeStatusHeartbeatMs: number;
+  bridgeWatchdogEnabled: boolean;
+  bridgeWatchdogStallMs: number;
 };
 
 export type BridgeState = {
