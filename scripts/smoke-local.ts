@@ -21,6 +21,8 @@ const deps: BridgeAppDeps = {
     bridgeRequireCallbackAuth: false,
     bridgeStatusHeartbeatEnabled: true,
     bridgeStatusHeartbeatMs: 180000,
+    bridgeWatchdogEnabled: true,
+    bridgeWatchdogStallMs: 480000,
   },
   codex: { status: () => ({ connected: true }) } as any,
   eclaw: { sendMessage: async (_state: unknown, message: string) => sent.push(message) } as any,

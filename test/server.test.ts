@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import request from "supertest";
-import { buildStatusHeartbeatMessage, createApp, sendStatusHeartbeat } from "../src/server.js";
+import { buildStatusHeartbeatMessage, createApp, runWatchdog, sendStatusHeartbeat } from "../src/server.js";
 import type { BridgeAppDeps } from "../src/server.js";
 import type { BridgeConfig } from "../src/types.js";
 
@@ -22,12 +22,14 @@ const config: BridgeConfig = {
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,
+  bridgeWatchdogEnabled: true,
+  bridgeWatchdogStallMs: 480000,
 };
 
 function deps(): BridgeAppDeps {
   return {
     config,
-    codex: { status: () => ({ connected: true }) } as any,
+    codex: { status: () => ({ connected: true }), restart: vi.fn().mockResolvedValue(undefined) } as any,
     eclaw: { sendMessage: vi.fn().mockResolvedValue({ success: true }) } as any,
     stateStore: { read: vi.fn().mockResolvedValue({ deviceId: "dev", entityId: 1, botSecret: "secret" }), write: vi.fn() } as any,
     sessionManager: {
@@ -35,6 +37,7 @@ function deps(): BridgeAppDeps {
       handleInbound: vi.fn().mockResolvedValue("Codex reply"),
       interrupt: vi.fn(),
       reset: vi.fn(),
+      recoverStalledTurn: vi.fn(),
     } as any,
     approvalRouter: {
       status: () => ({ pending: 0, askIds: [] }),
@@ -173,6 +176,33 @@ describe("server", () => {
       expect.stringContaining("pending approval(s): ask_1"),
       { busy: true },
     );
+  });
+
+  it("watchdog restarts Codex when the app-server disconnects", async () => {
+    const d = deps();
+    d.codex.status = () => ({ connected: false });
+
+    await expect(runWatchdog(d)).resolves.toBe(true);
+    expect(d.codex.restart).toHaveBeenCalled();
+    expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("app-server websocket disconnected"),
+      { busy: true },
+    );
+  });
+
+  it("watchdog recovers a stalled turn when no approval is pending", async () => {
+    const d = deps();
+    const oldActivity = new Date(Date.now() - 10 * 60_000).toISOString();
+    d.sessionManager.status = () => ({
+      activeThreadId: "thread_1",
+      activeTurnId: "turn_1",
+      lastActivityAt: oldActivity,
+      bufferedChars: 0,
+    });
+
+    await expect(runWatchdog(d)).resolves.toBe(true);
+    expect(d.sessionManager.recoverStalledTurn).toHaveBeenCalledWith(expect.stringContaining("No Codex activity"));
   });
 
   it("supports local /ask diagnostics without sending to EClaw", async () => {
