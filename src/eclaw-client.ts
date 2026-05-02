@@ -34,7 +34,7 @@ export class EClawClient {
     return this.post<ChannelBindResponse>("/api/channel/bind", body);
   }
 
-  async sendMessage(state: BridgeState, message: string, options: { card?: EClawCard; busy?: boolean } = {}): Promise<ChannelMessageResponse> {
+  async sendMessage(state: BridgeState, message: string, options: { card?: EClawCard; busy?: boolean; suppressA2A?: boolean } = {}): Promise<ChannelMessageResponse> {
     if (!state.deviceId || state.entityId === undefined || !state.botSecret) {
       throw new Error("EClaw entity is not bound yet.");
     }
@@ -47,6 +47,7 @@ export class EClawClient {
       state: options.busy ? "BUSY" : "IDLE",
       message,
       ...(options.card && { card: options.card }),
+      ...(options.suppressA2A && { suppressA2A: true }),
     };
     return this.post<ChannelMessageResponse>("/api/channel/message", body);
   }

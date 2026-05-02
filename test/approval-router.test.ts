@@ -20,6 +20,15 @@ const config: BridgeConfig = {
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,
+  bridgeWatchdogEnabled: true,
+  bridgeWatchdogStallMs: 480000,
+  bridgePublicWebhookWatchdogEnabled: true,
+  bridgePublicWebhookWatchdogMs: 120000,
+  bridgePublicWebhookTimeoutMs: 10000,
+  bridgeManagedTunnelEnabled: false,
+  bridgeTunnelBin: "cloudflared",
+  bridgeTunnelTargetUrl: "http://localhost:18800",
+  bridgeTunnelReadyTimeoutMs: 45000,
 };
 
 describe("ApprovalRouter", () => {

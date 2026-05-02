@@ -1,6 +1,8 @@
 import type { CodexClient } from "./codex-client.js";
 import type { EClawClient } from "./eclaw-client.js";
+import { sanitizeCodexModel, sanitizeCodexReasoningEffort } from "./model.js";
 import { formatInboundForCodex } from "./payload.js";
+import { redactSensitiveText } from "./redact.js";
 import type { StateStore } from "./state-store.js";
 import type { BridgeConfig, BridgeState, EClawInboundPayload, ServerNotificationMessage } from "./types.js";
 
@@ -25,6 +27,23 @@ type ActiveTurn = {
   timer: NodeJS.Timeout;
 };
 
+export class CodexTurnError extends Error {
+  constructor(
+    message: string,
+    readonly rawError?: unknown,
+  ) {
+    super(sanitizeErrorMessage(message));
+    this.name = "CodexTurnError";
+  }
+}
+
+export class CodexWatchdogRecoveryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexWatchdogRecoveryError";
+  }
+}
+
 export class SessionManager {
   private activeTurn?: ActiveTurn;
   private readonly resumedThreads = new Set<string>();
@@ -40,7 +59,7 @@ export class SessionManager {
   }
 
   async ensureThread(): Promise<string> {
-    const state = await this.stateStore.read();
+    const { state, model } = await this.readStateWithSafeSettings();
     const baseInstructions = await this.baseInstructions(state);
     if (state.threadId) {
       if (!this.resumedThreads.has(state.threadId)) {
@@ -48,7 +67,7 @@ export class SessionManager {
           await this.codex.request("thread/resume", {
             threadId: state.threadId,
             cwd: this.config.codexWorkspace,
-            model: state.model ?? this.config.codexModel ?? null,
+            model,
             approvalPolicy: this.config.codexApprovalPolicy,
             sandbox: this.config.codexSandbox,
             baseInstructions,
@@ -66,7 +85,7 @@ export class SessionManager {
     }
     const response = await this.codex.request<ThreadStartResponse>("thread/start", {
       cwd: this.config.codexWorkspace,
-      model: state.model ?? this.config.codexModel ?? null,
+      model,
       approvalPolicy: this.config.codexApprovalPolicy,
       sandbox: this.config.codexSandbox,
       baseInstructions,
@@ -87,11 +106,11 @@ export class SessionManager {
     if (this.activeTurn) {
       throw new Error("Codex is still processing the previous message. Use /interrupt if you want to stop it.");
     }
-    const state = await this.stateStore.read();
+    const { state, model, effort } = await this.readStateWithSafeSettings();
     const threadId = await this.ensureThread();
     const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
     if (this.config.bridgeSendBusyUpdates) {
-      await this.eclaw.sendMessage(state, "Codex is working...", { busy: true }).catch(() => undefined);
+      await this.eclaw.sendMessage(state, "Codex is working...", { busy: true, suppressA2A: true }).catch(() => undefined);
     }
     const input = formatInboundForCodex(payload);
     try {
@@ -99,8 +118,8 @@ export class SessionManager {
         threadId,
         input: [{ type: "text", text: input, text_elements: [] }],
         cwd: this.config.codexWorkspace,
-        model: state.model ?? this.config.codexModel ?? null,
-        effort: this.config.codexReasoningEffort ?? null,
+        model,
+        effort,
         approvalPolicy: this.config.codexApprovalPolicy,
       });
       const turnId = response.turn?.id;
@@ -120,6 +139,10 @@ export class SessionManager {
       }
       if (retryOnMissingThread && isMissingThreadError(err)) {
         await this.stateStore.clearThread();
+        return this.handleInboundOnce(payload, false);
+      }
+      if (retryOnMissingThread && this.isRecoverableCodexError(err)) {
+        await this.selfRepairAndNotify(err, payload);
         return this.handleInboundOnce(payload, false);
       }
       throw err;
@@ -144,7 +167,19 @@ export class SessionManager {
     if (state.threadId) {
       await this.codex.request("thread/archive", { threadId: state.threadId }).catch(() => undefined);
     }
+    this.resumedThreads.clear();
     return this.stateStore.clearThread();
+  }
+
+  async recoverStalledTurn(reason: string): Promise<boolean> {
+    const active = this.activeTurn;
+    if (!active) return false;
+    clearTimeout(active.timer);
+    this.activeTurn = undefined;
+    this.lastTurnError = reason;
+    await this.stateStore.write({ activeTurnId: undefined }).catch(() => undefined);
+    active.reject(new CodexWatchdogRecoveryError(reason));
+    return true;
   }
 
   status(): {
@@ -221,10 +256,14 @@ export class SessionManager {
 
     if (message.method === "turn/completed") {
       const turnError = this.extractTurnError(params);
-      const text = turnError || this.extractFinalText(params) || this.activeTurn.text.trim() || "Done.";
-      this.lastTurnError = turnError || undefined;
+      const text = this.extractFinalText(params) || this.activeTurn.text.trim() || "Done.";
+      this.lastTurnError = turnError ? sanitizeErrorMessage(turnError) : undefined;
       clearTimeout(this.activeTurn.timer);
-      this.activeTurn.resolve(text);
+      if (turnError) {
+        this.activeTurn.reject(new CodexTurnError(turnError, params.turn?.error));
+      } else {
+        this.activeTurn.resolve(text);
+      }
       this.stateStore.write({ activeTurnId: undefined }).catch(() => undefined);
       this.activeTurn = undefined;
     }
@@ -234,6 +273,28 @@ export class SessionManager {
     if (!this.activeTurn) return;
     this.activeTurn.lastActivityAt = Date.now();
     this.activeTurn.lastEvent = event;
+  }
+
+  private async readStateWithSafeSettings(): Promise<{ state: BridgeState; model: string | null; effort: string | null }> {
+    const state = await this.stateStore.read();
+    const safeStateModel = sanitizeCodexModel(state.model);
+    const safeStateEffort = sanitizeCodexReasoningEffort(state.reasoningEffort);
+    if ((state.model && !safeStateModel) || (state.reasoningEffort && !safeStateEffort)) {
+      this.lastTurnError = "Rejected unsafe Codex model or reasoning override from bridge state.";
+      await this.stateStore.write({ model: safeStateModel, reasoningEffort: safeStateEffort, threadId: undefined, activeTurnId: undefined });
+      this.resumedThreads.clear();
+      const repairedState = await this.stateStore.read();
+      return {
+        state: repairedState,
+        model: sanitizeCodexModel(this.config.codexModel) ?? null,
+        effort: sanitizeCodexReasoningEffort(this.config.codexReasoningEffort) ?? null,
+      };
+    }
+    return {
+      state,
+      model: safeStateModel ?? sanitizeCodexModel(this.config.codexModel) ?? null,
+      effort: safeStateEffort ?? sanitizeCodexReasoningEffort(this.config.codexReasoningEffort) ?? null,
+    };
   }
 
   private extractFinalText(params: Record<string, any>): string {
@@ -258,7 +319,7 @@ export class SessionManager {
   private extractTurnError(params: Record<string, any>): string {
     const errorMessage = params.turn?.error?.message;
     if (params.turn?.status !== "failed" || typeof errorMessage !== "string") return "";
-    return `Codex error: ${errorMessage}`;
+    return errorMessage;
   }
 
   private extractRawResponseText(item: any): string {
@@ -294,6 +355,7 @@ export class SessionManager {
   }
 
   private async sendStopProgressUpdateIfRequired(state: BridgeState, reply: string): Promise<void> {
+    if (isCodexErrorText(reply)) return;
     const remotePolicy = await this.eclaw.getPromptPolicy(state, "codex").catch(() => null);
     const compiledPrompt = remotePolicy?.policy?.compiledPrompt ?? "";
     if (!requiresStopProgressTransform(compiledPrompt)) return;
@@ -307,8 +369,46 @@ export class SessionManager {
         "阻塞點：無。",
         "下一步：等待下一個指令。",
       ].join("\n"),
-      { busy: true },
+      { busy: true, suppressA2A: true },
     ).catch(() => undefined);
+  }
+
+  private isRecoverableCodexError(err: unknown): boolean {
+    if (err instanceof CodexWatchdogRecoveryError) return true;
+    if (!(err instanceof Error)) return false;
+    const message = err.message.toLowerCase();
+    return (
+      err instanceof CodexTurnError && (
+        message.includes("invalid_request_error") ||
+        message.includes("local variables avail") ||
+        message.includes("websocket") ||
+        message.includes("app-server")
+      )
+    ) || (
+      message.includes("codex app-server websocket is not connected") ||
+      message.includes("codex app-server websocket closed")
+    );
+  }
+
+  private async selfRepairAndNotify(err: unknown, payload: EClawInboundPayload): Promise<void> {
+    const reason = summarizeRepairReason(err);
+    const state = await this.stateStore.read();
+    this.lastTurnError = reason;
+    await this.eclaw.sendMessage(
+      state,
+      [
+        "Codex watchdog self-repair",
+        `- Trigger: ${reason}`,
+        "- Action: reset Codex thread/app-server state and retry once with sanitized EClaw metadata.",
+        `- Task: ${summarizePromptForStatus(payload.text ?? "")}`,
+      ].join("\n"),
+      { busy: true, suppressA2A: true },
+    ).catch(() => undefined);
+    await this.stateStore.clearThread();
+    this.resumedThreads.clear();
+    if (typeof this.codex.restart === "function") {
+      await this.codex.restart().catch(() => undefined);
+    }
   }
 }
 
@@ -322,6 +422,24 @@ export function requiresStopProgressTransform(compiledPrompt: string): boolean {
 
 function isMissingThreadError(err: unknown): boolean {
   return err instanceof Error && /thread not found/i.test(err.message);
+}
+
+function isCodexErrorText(text: string): boolean {
+  return /^\s*Codex error:/i.test(text) || /^\s*Bridge error:/i.test(text);
+}
+
+function sanitizeErrorMessage(message: string): string {
+  return redactSensitiveText(message);
+}
+
+function summarizeRepairReason(err: unknown): string {
+  if (!(err instanceof Error)) return "unknown recoverable Codex error";
+  const message = sanitizeErrorMessage(err.message).replace(/\s+/g, " ").trim();
+  if (/local variables avail/i.test(message)) return "Codex rejected the inlined EClaw local-vault marker";
+  if (/invalid_request_error/i.test(message)) return "Codex invalid_request_error";
+  if (/websocket|app-server/i.test(message)) return "Codex app-server connection problem";
+  if (err instanceof CodexWatchdogRecoveryError) return "Codex turn stalled without activity";
+  return message.slice(0, 160);
 }
 
 function summarizePromptForStatus(text: string): string {

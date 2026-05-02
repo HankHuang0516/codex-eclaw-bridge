@@ -50,7 +50,7 @@ export class ApprovalRouter {
       buttons: this.buttonsFor(request),
     };
     const state = await this.stateStore.read();
-    await this.eclaw.sendMessage(state, request.body, { card });
+    await this.eclaw.sendMessage(state, request.body, { card, suppressA2A: true });
   }
 
   resolveFromPayload(payload: EClawInboundPayload): boolean {

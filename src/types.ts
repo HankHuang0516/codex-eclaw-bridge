@@ -23,6 +23,15 @@ export type BridgeConfig = {
   bridgeRequireCallbackAuth: boolean;
   bridgeStatusHeartbeatEnabled: boolean;
   bridgeStatusHeartbeatMs: number;
+  bridgeWatchdogEnabled: boolean;
+  bridgeWatchdogStallMs: number;
+  bridgePublicWebhookWatchdogEnabled: boolean;
+  bridgePublicWebhookWatchdogMs: number;
+  bridgePublicWebhookTimeoutMs: number;
+  bridgeManagedTunnelEnabled: boolean;
+  bridgeTunnelBin: string;
+  bridgeTunnelTargetUrl: string;
+  bridgeTunnelReadyTimeoutMs: number;
 };
 
 export type BridgeState = {
@@ -33,6 +42,7 @@ export type BridgeState = {
   publicCode?: string;
   threadId?: string;
   model?: string;
+  reasoningEffort?: string;
   activeTurnId?: string;
   startedAt?: string;
   updatedAt?: string;

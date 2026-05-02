@@ -4,18 +4,29 @@ import { loadConfig } from "./config.js";
 import { CodexClient } from "./codex-client.js";
 import { EClawClient } from "./eclaw-client.js";
 import { ApprovalRouter } from "./approval-router.js";
+import { sanitizeCodexModel, sanitizeCodexReasoningEffort } from "./model.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
+import { redactSensitiveText } from "./redact.js";
 import { SessionManager } from "./session-manager.js";
 import { StateStore } from "./state-store.js";
+import { ManagedTunnel } from "./tunnel-manager.js";
 import type { BridgeConfig, EClawCard, EClawInboundPayload } from "./types.js";
 
 const MODEL_PICKER_ASK_ID = "codex_model_picker";
+const REASONING_PICKER_ASK_ID = "codex_reasoning_picker";
 const MODEL_OPTIONS = [
   { id: "gpt-5.5", label: "GPT-5.5", style: "primary" },
   { id: "gpt-5.4", label: "GPT-5.4", style: "secondary" },
   { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", style: "secondary" },
   { id: "gpt-5.3-codex", label: "GPT-5.3 Codex", style: "secondary" },
 ] as const;
+const REASONING_OPTIONS = [
+  { id: "low", label: "低", style: "secondary" },
+  { id: "medium", label: "中", style: "primary" },
+  { id: "high", label: "高", style: "secondary" },
+  { id: "xhigh", label: "超高", style: "secondary" },
+] as const;
+const MANAGED_TUNNEL_REGISTER_ATTEMPTS = 20;
 
 export type BridgeAppDeps = {
   config: BridgeConfig;
@@ -24,7 +35,26 @@ export type BridgeAppDeps = {
   stateStore: StateStore;
   sessionManager: SessionManager;
   approvalRouter: ApprovalRouter;
+  tunnelManager?: ManagedTunnel;
+  publicWebhookMonitor?: PublicWebhookMonitor;
 };
+
+export type PublicWebhookMonitor = {
+  lastCheckedAt: number;
+  lastAlertAt: number;
+  lastFailure?: string;
+};
+
+export type PublicWebhookHealth = {
+  ok: boolean;
+  url: string;
+  status?: number;
+  error?: string;
+};
+
+export function createPublicWebhookMonitor(): PublicWebhookMonitor {
+  return { lastCheckedAt: 0, lastAlertAt: 0 };
+}
 
 export function createApp(deps: BridgeAppDeps): express.Express {
   const app = express();
@@ -53,6 +83,18 @@ export function createApp(deps: BridgeAppDeps): express.Express {
       codex: deps.codex.status(),
       session: deps.sessionManager.status(),
       approvals: deps.approvalRouter.status(),
+      tunnel: deps.tunnelManager?.status(),
+      publicWebhook: deps.publicWebhookMonitor
+        ? {
+            lastCheckedAt: deps.publicWebhookMonitor.lastCheckedAt
+              ? new Date(deps.publicWebhookMonitor.lastCheckedAt).toISOString()
+              : undefined,
+            lastAlertAt: deps.publicWebhookMonitor.lastAlertAt
+              ? new Date(deps.publicWebhookMonitor.lastAlertAt).toISOString()
+              : undefined,
+            lastFailure: deps.publicWebhookMonitor.lastFailure,
+          }
+        : undefined,
     });
   });
 
@@ -121,6 +163,10 @@ export async function bootstrap(): Promise<void> {
   const eclaw = new EClawClient(config);
   const codex = new CodexClient(config);
   await codex.start();
+  const tunnelManager = config.bridgeManagedTunnelEnabled ? new ManagedTunnel(config) : undefined;
+  if (tunnelManager) {
+    config.eclawWebhookUrl = await tunnelManager.ensureStarted();
+  }
 
   const sessionManager = new SessionManager(config, codex, eclaw, stateStore);
   const approvalRouter = new ApprovalRouter(config, codex, eclaw, stateStore);
@@ -132,10 +178,27 @@ export async function bootstrap(): Promise<void> {
     }
   });
 
-  await registerAndBind(eclaw, stateStore);
+  try {
+    await registerAndBindWithRetry(eclaw, stateStore, config.bridgeManagedTunnelEnabled ? MANAGED_TUNNEL_REGISTER_ATTEMPTS : 1);
+  } catch (err) {
+    await tunnelManager?.stop().catch(() => undefined);
+    await codex.stop().catch(() => undefined);
+    throw err;
+  }
 
-  const app = createApp({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
-  const heartbeat = startStatusHeartbeat({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
+  const deps = {
+    config,
+    codex,
+    eclaw,
+    stateStore,
+    sessionManager,
+    approvalRouter,
+    tunnelManager,
+    publicWebhookMonitor: createPublicWebhookMonitor(),
+  };
+  const app = createApp(deps);
+  const heartbeat = startStatusHeartbeat(deps);
+  const watchdog = startWatchdog(deps);
   app.listen(config.eclawWebhookPort, () => {
     console.log(`[bridge] listening on http://localhost:${config.eclawWebhookPort}`);
     console.log(`[bridge] public webhook: ${config.eclawWebhookUrl}/eclaw-webhook`);
@@ -143,7 +206,9 @@ export async function bootstrap(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     if (heartbeat) clearInterval(heartbeat);
+    if (watchdog) clearInterval(watchdog);
     await eclaw.unregisterCallback().catch(() => undefined);
+    await tunnelManager?.stop().catch(() => undefined);
     await codex.stop();
     process.exit(0);
   };
@@ -160,6 +225,112 @@ export function startStatusHeartbeat(deps: BridgeAppDeps): NodeJS.Timeout | unde
   return timer;
 }
 
+export function startWatchdog(deps: BridgeAppDeps): NodeJS.Timeout | undefined {
+  if (!deps.config.bridgeWatchdogEnabled) return undefined;
+  const intervalMs = Math.max(30_000, Math.min(deps.config.bridgeWatchdogStallMs / 2, 120_000));
+  const timer = setInterval(() => {
+    runWatchdog(deps).catch((err) => console.error("[bridge] watchdog failed:", err.message));
+  }, intervalMs);
+  timer.unref?.();
+  return timer;
+}
+
+export async function runWatchdog(deps: BridgeAppDeps): Promise<boolean> {
+  if (await runPublicWebhookWatchdog(deps)) return true;
+
+  if (!deps.codex.status().connected) {
+    await deps.codex.restart();
+    const state = await deps.stateStore.read();
+    await deps.eclaw.sendMessage(state, [
+      "Codex watchdog self-repair",
+      "- Trigger: app-server websocket disconnected.",
+      "- Action: restarted Codex app-server.",
+    ].join("\n"), { busy: true, suppressA2A: true }).catch(() => undefined);
+    return true;
+  }
+
+  const session = deps.sessionManager.status();
+  if (!session.activeThreadId) return false;
+  if (deps.approvalRouter.status().pending > 0) return false;
+  if (!session.lastActivityAt) return false;
+
+  const idleMs = Date.now() - Date.parse(session.lastActivityAt);
+  if (Number.isNaN(idleMs) || idleMs < deps.config.bridgeWatchdogStallMs) return false;
+
+  await deps.sessionManager.recoverStalledTurn(`No Codex activity for ${formatElapsed(idleMs)}.`);
+  return true;
+}
+
+export async function runPublicWebhookWatchdog(deps: BridgeAppDeps): Promise<boolean> {
+  if (!deps.config.bridgePublicWebhookWatchdogEnabled || !deps.publicWebhookMonitor) return false;
+
+  const now = Date.now();
+  if (now - deps.publicWebhookMonitor.lastCheckedAt < deps.config.bridgePublicWebhookWatchdogMs) {
+    return false;
+  }
+  deps.publicWebhookMonitor.lastCheckedAt = now;
+
+  const health = await checkPublicWebhookHealth(deps.config);
+  if (health.ok) {
+    deps.publicWebhookMonitor.lastFailure = undefined;
+    return false;
+  }
+
+  deps.publicWebhookMonitor.lastFailure = health.error ?? `HTTP ${health.status ?? "unknown"}`;
+  if (deps.tunnelManager && deps.config.bridgeManagedTunnelEnabled) {
+    const previousUrl = deps.config.eclawWebhookUrl;
+    const nextUrl = await deps.tunnelManager.restart();
+    deps.config.eclawWebhookUrl = nextUrl;
+    await registerAndBindWithRetry(deps.eclaw, deps.stateStore, MANAGED_TUNNEL_REGISTER_ATTEMPTS);
+    const state = await deps.stateStore.read();
+    await deps.eclaw.sendMessage(state, [
+      "Codex watchdog self-repair",
+      "- Trigger: public webhook health check failed.",
+      `- Previous URL: ${previousUrl}`,
+      `- New URL: ${nextUrl}`,
+      "- Action: restarted managed tunnel and re-registered EClaw callback.",
+    ].join("\n"), { busy: true, suppressA2A: true }).catch(() => undefined);
+    deps.publicWebhookMonitor.lastFailure = undefined;
+    return true;
+  }
+
+  const alertCooldownMs = Math.max(600_000, deps.config.bridgePublicWebhookWatchdogMs);
+  if (now - deps.publicWebhookMonitor.lastAlertAt >= alertCooldownMs) {
+    deps.publicWebhookMonitor.lastAlertAt = now;
+    const state = await deps.stateStore.read();
+    await deps.eclaw.sendMessage(state, [
+      "Codex watchdog needs operator action",
+      "- Trigger: public webhook health check failed.",
+      `- URL: ${deps.config.eclawWebhookUrl}`,
+      `- Reason: ${deps.publicWebhookMonitor.lastFailure}`,
+      "- Action needed: restart the public tunnel or enable BRIDGE_MANAGED_TUNNEL_ENABLED=true.",
+    ].join("\n"), { busy: true, suppressA2A: true }).catch(() => undefined);
+  }
+
+  return false;
+}
+
+export async function checkPublicWebhookHealth(config: BridgeConfig): Promise<PublicWebhookHealth> {
+  const url = `${config.eclawWebhookUrl}/health`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.bridgePublicWebhookTimeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return { ok: false, url, status: res.status, error: `HTTP ${res.status}` };
+    }
+    return { ok: true, url, status: res.status };
+  } catch (err: any) {
+    return { ok: false, url, error: sanitizeHealthError(err) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean> {
   const session = deps.sessionManager.status();
   if (!session.activeTurnId && !session.activeThreadId) return false;
@@ -170,7 +341,7 @@ export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean>
     approvals: deps.approvalRouter.status(),
     codex: deps.codex.status(),
   });
-  await deps.eclaw.sendMessage(state, message, { busy: true });
+  await deps.eclaw.sendMessage(state, message, { busy: true, suppressA2A: true });
   return true;
 }
 
@@ -203,6 +374,10 @@ function formatElapsed(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function registerAndBind(eclaw: EClawClient, stateStore: StateStore): Promise<void> {
   const registration = await eclaw.registerCallback();
   const binding = await eclaw.bindEntity();
@@ -213,6 +388,26 @@ export async function registerAndBind(eclaw: EClawClient, stateStore: StateStore
     botSecret: binding.botSecret,
     publicCode: binding.publicCode,
   });
+}
+
+export async function registerAndBindWithRetry(eclaw: EClawClient, stateStore: StateStore, attempts: number): Promise<void> {
+  let lastError: any;
+  const totalAttempts = Math.max(1, attempts);
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    try {
+      await registerAndBind(eclaw, stateStore);
+      return;
+    } catch (err: any) {
+      lastError = err;
+      if (attempt >= totalAttempts) break;
+      const waitMs = Math.min(2_000 * attempt, 10_000);
+      console.warn(
+        `[bridge] register/bind attempt ${attempt}/${totalAttempts} failed; retrying in ${waitMs}ms: ${sanitizeHealthError(err)}`,
+      );
+      await delay(waitMs);
+    }
+  }
+  throw lastError;
 }
 
 export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawInboundPayload): Promise<void> {
@@ -228,13 +423,27 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
   const ignore = shouldIgnoreInbound(payload);
   if (ignore.ignore) return;
 
+  const a2aInbound = isA2AInbound(payload);
+  if (a2aInbound && isOperationalA2AEcho(payload)) {
+    console.warn("[bridge] suppressed A2A operational echo.");
+    return;
+  }
+  if (a2aInbound && hasActiveCodexTurn(deps)) {
+    console.warn("[bridge] suppressed A2A inbound while Codex turn is active.");
+    return;
+  }
+
   try {
     const reply = await deps.sessionManager.handleInbound(payload);
     if (reply.trim()) {
       await deps.eclaw.sendMessage(await deps.stateStore.read(), reply);
     }
   } catch (err: any) {
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Bridge error: ${err.message}`);
+    if (a2aInbound && isOperationalBridgeError(err)) {
+      console.warn(`[bridge] suppressed operational bridge error for A2A inbound: ${sanitizeHealthError(err)}`);
+      return;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), formatBridgeError(err), { suppressA2A: true });
   }
 }
 
@@ -246,52 +455,127 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
       "Codex bridge status",
       `- Codex connected: ${deps.codex.status().connected}`,
       `- Thread: ${state.threadId ?? "(none)"}`,
+      `- Model: ${sanitizeCodexModel(state.model) ?? sanitizeCodexModel(deps.config.codexModel) ?? "(default)"}`,
+      `- Intelligence: ${reasoningLabel(currentReasoningEffort(state, deps.config))}`,
       `- Active turn: ${deps.sessionManager.status().activeTurnId ?? "(none)"}`,
       `- Pending approvals: ${deps.approvalRouter.status().pending}`,
-    ].join("\n"));
+      `- Last Codex error: ${deps.sessionManager.status().lastTurnError ?? "(none)"}`,
+      `- Watchdog: ${deps.config.bridgeWatchdogEnabled ? `enabled, stall ${formatElapsed(deps.config.bridgeWatchdogStallMs)}` : "disabled"}`,
+    ].join("\n"), { suppressA2A: true });
     return;
   }
   if (command.name === "reset") {
     await deps.sessionManager.reset();
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), "Codex bridge thread reset.");
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), "Codex bridge thread reset.", { suppressA2A: true });
     return;
   }
   if (command.name === "interrupt") {
     const didInterrupt = await deps.sessionManager.interrupt();
-    await deps.eclaw.sendMessage(state, didInterrupt ? "Codex turn interrupted." : "No active Codex turn.");
+    await deps.eclaw.sendMessage(state, didInterrupt ? "Codex turn interrupted." : "No active Codex turn.", { suppressA2A: true });
     return;
   }
   if (command.name === "model") {
+    const currentModel = sanitizeCodexModel(state.model) ?? sanitizeCodexModel(deps.config.codexModel);
+    const currentEffort = currentReasoningEffort(state, deps.config);
     if (!command.args) {
-      await deps.eclaw.sendMessage(state, modelPickerBody(state.model ?? deps.config.codexModel), {
-        card: modelPickerCard(state.model ?? deps.config.codexModel),
+      await deps.eclaw.sendMessage(state, modelPickerBody(currentModel), {
+        card: modelPickerCard(currentModel),
+        suppressA2A: true,
+      });
+      await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
+        card: reasoningPickerCard(currentEffort),
+        suppressA2A: true,
       });
       return;
     }
-    await setCodexModel(deps, command.args);
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${command.args}. New turns will use a fresh thread.`);
+    const model = await setCodexModel(deps, command.args);
+    if (!model) {
+      await deps.eclaw.sendMessage(state, "Invalid Codex model name. Use a short model id like `gpt-5.5`.", { suppressA2A: true });
+      return;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`, { suppressA2A: true });
+    const nextState = await deps.stateStore.read();
+    const nextEffort = currentReasoningEffort(nextState, deps.config);
+    await deps.eclaw.sendMessage(nextState, reasoningPickerBody(nextEffort), {
+      card: reasoningPickerCard(nextEffort),
+      suppressA2A: true,
+    });
+    return;
+  }
+  if (command.name === "effort" || command.name === "reasoning") {
+    if (!command.args) {
+      const currentEffort = currentReasoningEffort(state, deps.config);
+      await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
+        card: reasoningPickerCard(currentEffort),
+        suppressA2A: true,
+      });
+      return;
+    }
+    const effort = await setCodexReasoningEffort(deps, command.args);
+    if (!effort) {
+      await deps.eclaw.sendMessage(state, "Invalid Codex intelligence value. Use `low`, `medium`, `high`, `xhigh`, or `低` / `中` / `高` / `超高`.", { suppressA2A: true });
+      return;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(effort)} (${effort}). New turns will use a fresh thread.`, { suppressA2A: true });
+    return;
   }
 }
 
 async function handleModelPickerAction(deps: BridgeAppDeps, payload: EClawInboundPayload): Promise<boolean> {
   if (payload.event !== "card_action") return false;
-  if (payload.ask_id !== MODEL_PICKER_ASK_ID) return false;
   const actionId = payload.action_id ?? "";
-  if (!actionId.startsWith("model:")) return false;
+  if (payload.ask_id === MODEL_PICKER_ASK_ID) {
+    if (!actionId.startsWith("model:")) return false;
 
-  const model = actionId.slice("model:".length).trim();
-  if (!MODEL_OPTIONS.some((option) => option.id === model)) {
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`);
+    const model = actionId.slice("model:".length).trim();
+    if (!MODEL_OPTIONS.some((option) => option.id === model)) {
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`, { suppressA2A: true });
+      return true;
+    }
+    const safeModel = await setCodexModel(deps, model);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${safeModel}. New turns will use a fresh thread.`, { suppressA2A: true });
+    const state = await deps.stateStore.read();
+    const currentEffort = currentReasoningEffort(state, deps.config);
+    await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
+      card: reasoningPickerCard(currentEffort),
+      suppressA2A: true,
+    });
     return true;
   }
-  await setCodexModel(deps, model);
-  await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`);
-  return true;
+
+  if (payload.ask_id === REASONING_PICKER_ASK_ID) {
+    if (!actionId.startsWith("effort:")) return false;
+    const effort = actionId.slice("effort:".length).trim();
+    if (!REASONING_OPTIONS.some((option) => option.id === effort)) {
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`, { suppressA2A: true });
+      return true;
+    }
+    const safeEffort = await setCodexReasoningEffort(deps, effort);
+    if (!safeEffort) {
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`, { suppressA2A: true });
+      return true;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(safeEffort)} (${safeEffort}). New turns will use a fresh thread.`, { suppressA2A: true });
+    return true;
+  }
+
+  return false;
 }
 
-async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<void> {
-  await deps.stateStore.write({ model });
+async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<string | undefined> {
+  const safeModel = sanitizeCodexModel(model);
+  if (!safeModel) return undefined;
+  await deps.stateStore.write({ model: safeModel });
   await deps.sessionManager.reset();
+  return safeModel;
+}
+
+async function setCodexReasoningEffort(deps: BridgeAppDeps, effort: string): Promise<string | undefined> {
+  const safeEffort = sanitizeCodexReasoningEffort(effort);
+  if (!safeEffort) return undefined;
+  await deps.stateStore.write({ reasoningEffort: safeEffort });
+  await deps.sessionManager.reset();
+  return safeEffort;
 }
 
 function modelPickerBody(currentModel?: string): string {
@@ -314,6 +598,73 @@ function modelPickerCard(currentModel?: string): EClawCard {
       style: option.style,
     })),
   };
+}
+
+function reasoningPickerBody(currentEffort?: string): string {
+  return [
+    "選擇 Codex 智慧功能等級，會套用到之後的新對話。",
+    `目前智慧功能：${reasoningLabel(currentEffort)}`,
+    "",
+    "低較快，中較平衡，高/超高會在複雜工作上投入更多推理。",
+  ].join("\n");
+}
+
+function reasoningPickerCard(currentEffort?: string): EClawCard {
+  return {
+    ask_id: REASONING_PICKER_ASK_ID,
+    title: "Codex 智慧功能",
+    body: `目前：${reasoningLabel(currentEffort)}`,
+    buttons: REASONING_OPTIONS.map((option) => ({
+      id: `effort:${option.id}`,
+      label: option.label,
+      style: option.id === currentEffort ? "primary" : option.style,
+    })),
+  };
+}
+
+function reasoningLabel(effort?: string): string {
+  if (effort === "low") return "低";
+  if (effort === "medium") return "中";
+  if (effort === "high") return "高";
+  if (effort === "xhigh") return "超高";
+  return "(default)";
+}
+
+function currentReasoningEffort(state: { reasoningEffort?: string }, config: BridgeConfig): string | undefined {
+  return sanitizeCodexReasoningEffort(state.reasoningEffort) ?? sanitizeCodexReasoningEffort(config.codexReasoningEffort);
+}
+
+function isA2AInbound(payload: EClawInboundPayload): boolean {
+  if (payload.fromEntityId !== undefined && payload.fromEntityId !== null) return true;
+
+  const event = String(payload.event ?? "").toLowerCase();
+  if (["entity_message", "broadcast", "org_forward"].includes(event)) return true;
+
+  const from = String(payload.from ?? "").toLowerCase();
+  if (from.startsWith("entity:") || from.startsWith("xdevice:")) return true;
+
+  const text = payload.text ?? "";
+  return /^\[(bot-to-bot message|broadcast from|org forward)\b/i.test(text);
+}
+
+function hasActiveCodexTurn(deps: BridgeAppDeps): boolean {
+  const session = deps.sessionManager.status();
+  return !!(session.activeTurnId || session.activeThreadId);
+}
+
+function isOperationalA2AEcho(payload: EClawInboundPayload): boolean {
+  const text = payload.text ?? "";
+  return /\b(Codex bridge error|Bridge error|Codex status heartbeat|Codex heartbeat|Codex watchdog|watchdog self-repair)\b/i.test(text);
+}
+
+function isOperationalBridgeError(err: any): boolean {
+  const message = String(err?.message ?? err ?? "").toLowerCase();
+  return (
+    message.includes("still processing the previous message") ||
+    message.includes("codex reply timed out") ||
+    message.includes("codex app-server websocket") ||
+    message.includes("app-server websocket")
+  );
 }
 
 function verifyCallbackAuth(config: BridgeConfig) {
@@ -348,6 +699,26 @@ function safeEqual(a: string, b: string): boolean {
   const right = Buffer.from(b);
   if (left.length !== right.length) return false;
   return crypto.timingSafeEqual(left, right);
+}
+
+function formatBridgeError(err: any): string {
+  const raw = err?.message ? String(err.message) : "unknown bridge error";
+  const message = redactSensitiveText(raw)
+    .replace(/\s+/g, " ")
+    .slice(0, 300);
+  return [
+    "Codex bridge error",
+    `- Status: watchdog could not recover this turn automatically.`,
+    `- Reason: ${message}`,
+    "- Next: send `!codex status`, `!codex reset`, or retry the task.",
+  ].join("\n");
+}
+
+function sanitizeHealthError(err: any): string {
+  const raw = err?.message ? String(err.message) : String(err ?? "unknown health check error");
+  return redactSensitiveText(raw)
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
 }
 
 function redactState(state: Record<string, unknown>): Record<string, unknown> {

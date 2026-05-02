@@ -21,6 +21,15 @@ const config: BridgeConfig = {
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,
+  bridgeWatchdogEnabled: true,
+  bridgeWatchdogStallMs: 480000,
+  bridgePublicWebhookWatchdogEnabled: true,
+  bridgePublicWebhookWatchdogMs: 120000,
+  bridgePublicWebhookTimeoutMs: 10000,
+  bridgeManagedTunnelEnabled: false,
+  bridgeTunnelBin: "cloudflared",
+  bridgeTunnelTargetUrl: "http://localhost:18800",
+  bridgeTunnelReadyTimeoutMs: 45000,
 };
 
 describe("EClawClient", () => {
@@ -43,6 +52,33 @@ describe("EClawClient", () => {
         botSecret: "secret",
         state: "IDLE",
         message: "hello",
+      }),
+    }));
+  });
+
+  it("can mark operational messages to suppress A2A routing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EClawClient(config);
+    await client.sendMessage({ deviceId: "dev", entityId: 2, botSecret: "secret" }, "Codex bridge status", {
+      busy: true,
+      suppressA2A: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("https://eclawbot.com/api/channel/message", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        channel_api_key: "eck_test",
+        deviceId: "dev",
+        entityId: 2,
+        botSecret: "secret",
+        state: "BUSY",
+        message: "Codex bridge status",
+        suppressA2A: true,
       }),
     }));
   });
