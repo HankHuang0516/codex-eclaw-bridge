@@ -4,7 +4,9 @@ import { loadConfig } from "./config.js";
 import { CodexClient } from "./codex-client.js";
 import { EClawClient } from "./eclaw-client.js";
 import { ApprovalRouter } from "./approval-router.js";
+import { sanitizeCodexModel } from "./model.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
+import { redactSensitiveText } from "./redact.js";
 import { SessionManager } from "./session-manager.js";
 import { StateStore } from "./state-store.js";
 import type { BridgeConfig, EClawCard, EClawInboundPayload } from "./types.js";
@@ -300,14 +302,19 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
     return;
   }
   if (command.name === "model") {
+    const currentModel = sanitizeCodexModel(state.model) ?? sanitizeCodexModel(deps.config.codexModel);
     if (!command.args) {
-      await deps.eclaw.sendMessage(state, modelPickerBody(state.model ?? deps.config.codexModel), {
-        card: modelPickerCard(state.model ?? deps.config.codexModel),
+      await deps.eclaw.sendMessage(state, modelPickerBody(currentModel), {
+        card: modelPickerCard(currentModel),
       });
       return;
     }
-    await setCodexModel(deps, command.args);
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${command.args}. New turns will use a fresh thread.`);
+    const model = await setCodexModel(deps, command.args);
+    if (!model) {
+      await deps.eclaw.sendMessage(state, "Invalid Codex model name. Use a short model id like `gpt-5.5`.");
+      return;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`);
   }
 }
 
@@ -322,14 +329,17 @@ async function handleModelPickerAction(deps: BridgeAppDeps, payload: EClawInboun
     await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`);
     return true;
   }
-  await setCodexModel(deps, model);
-  await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`);
+  const safeModel = await setCodexModel(deps, model);
+  await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${safeModel}. New turns will use a fresh thread.`);
   return true;
 }
 
-async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<void> {
-  await deps.stateStore.write({ model });
+async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<string | undefined> {
+  const safeModel = sanitizeCodexModel(model);
+  if (!safeModel) return undefined;
+  await deps.stateStore.write({ model: safeModel });
   await deps.sessionManager.reset();
+  return safeModel;
 }
 
 function modelPickerBody(currentModel?: string): string {
@@ -390,9 +400,7 @@ function safeEqual(a: string, b: string): boolean {
 
 function formatBridgeError(err: any): string {
   const raw = err?.message ? String(err.message) : "unknown bridge error";
-  const message = raw
-    .replace(/\b(eck|ecs)_[A-Za-z0-9_-]+/g, "$1_[redacted]")
-    .replace(/\b(?:deviceSecret|botSecret|token|password)=([^&\s]+)/gi, "$1=[redacted]")
+  const message = redactSensitiveText(raw)
     .replace(/\s+/g, " ")
     .slice(0, 300);
   return [

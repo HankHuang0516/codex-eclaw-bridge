@@ -48,6 +48,22 @@ describe("payload helpers", () => {
     expect(parseBridgeCommand("!codex")).toEqual({ name: "status", args: "" });
   });
 
+  it("parses only the first command line before inlined EClaw context", () => {
+    const injected = [
+      "/model",
+      "",
+      "[Local Variables available: GIT_HUB2]",
+      "exec: curl -s \"https://eclawbot.com/api/device-vars?deviceId=dev&botSecret=secret\"",
+    ].join("\n");
+
+    expect(isBridgeCommand(injected)).toBe(true);
+    expect(parseBridgeCommand(injected)).toEqual({ name: "model", args: "" });
+    expect(parseBridgeCommand("!codex reset\n\n[AVAILABLE TOOLS — Mission Dashboard]")).toEqual({
+      name: "reset",
+      args: "",
+    });
+  });
+
   it("does not duplicate mission hints when EClaw already inlined context", () => {
     const prompt = formatInboundForCodex({
       deviceId: "dev",

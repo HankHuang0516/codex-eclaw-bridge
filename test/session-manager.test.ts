@@ -119,6 +119,36 @@ class MockCodexRecoverableThenSuccess extends EventEmitter {
   }
 }
 
+class MockCodexCaptureModel extends EventEmitter {
+  models: unknown[] = [];
+
+  async request(method: string, params?: any): Promise<any> {
+    if (method === "thread/start") {
+      this.models.push(params?.model);
+      return { thread: { id: "thread_model" } };
+    }
+    if (method === "turn/start") {
+      this.models.push(params?.model);
+      queueMicrotask(() => {
+        this.emit("notification", {
+          method: "item/completed",
+          params: {
+            threadId: "thread_model",
+            turnId: "turn_model",
+            item: { type: "agentMessage", phase: "final_answer", text: "Model repaired." },
+          },
+        } satisfies ServerNotificationMessage);
+        this.emit("notification", {
+          method: "turn/completed",
+          params: { threadId: "thread_model", turnId: "turn_model" },
+        } satisfies ServerNotificationMessage);
+      });
+      return { turn: { id: "turn_model" } };
+    }
+    return {};
+  }
+}
+
 describe("SessionManager stop-progress enforcement", () => {
   it("detects centrally managed stop-progress transform policy", () => {
     expect(requiresStopProgressTransform("在停下手邊工作前，必須先呼叫 EClaw TRANSFORM API 回報目前進度。")).toBe(true);
@@ -218,5 +248,43 @@ describe("SessionManager stop-progress enforcement", () => {
       expect.stringContaining("Codex watchdog self-repair"),
       { busy: true },
     );
+  });
+
+  it("drops unsafe state model overrides before starting Codex", async () => {
+    let state: BridgeState = {
+      deviceId: "dev",
+      entityId: 6,
+      botSecret: "secret",
+      model: "[Local Variables available: GIT_HUB2]\nexec: curl -s \"https://example.com\"",
+    };
+    const stateStore = {
+      read: vi.fn().mockImplementation(async () => state),
+      write: vi.fn().mockImplementation(async (patch: BridgeState) => {
+        state = { ...state, ...patch };
+      }),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue({ success: true, policy: { compiledPrompt: "" } }),
+    };
+    const codex = new MockCodexCaptureModel();
+
+    const manager = new SessionManager(
+      { ...config, codexModel: "gpt-5.5" },
+      codex as any,
+      eclaw as any,
+      stateStore as any,
+    );
+    const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
+
+    expect(reply).toBe("Model repaired.");
+    expect(state.model).toBeUndefined();
+    expect(stateStore.write).toHaveBeenCalledWith({
+      model: undefined,
+      threadId: undefined,
+      activeTurnId: undefined,
+    });
+    expect(codex.models).toEqual(["gpt-5.5", "gpt-5.5"]);
   });
 });

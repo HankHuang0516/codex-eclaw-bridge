@@ -1,6 +1,8 @@
 import type { CodexClient } from "./codex-client.js";
 import type { EClawClient } from "./eclaw-client.js";
+import { sanitizeCodexModel } from "./model.js";
 import { formatInboundForCodex } from "./payload.js";
+import { redactSensitiveText } from "./redact.js";
 import type { StateStore } from "./state-store.js";
 import type { BridgeConfig, BridgeState, EClawInboundPayload, ServerNotificationMessage } from "./types.js";
 
@@ -57,7 +59,7 @@ export class SessionManager {
   }
 
   async ensureThread(): Promise<string> {
-    const state = await this.stateStore.read();
+    const { state, model } = await this.readStateWithSafeModel();
     const baseInstructions = await this.baseInstructions(state);
     if (state.threadId) {
       if (!this.resumedThreads.has(state.threadId)) {
@@ -65,7 +67,7 @@ export class SessionManager {
           await this.codex.request("thread/resume", {
             threadId: state.threadId,
             cwd: this.config.codexWorkspace,
-            model: state.model ?? this.config.codexModel ?? null,
+            model,
             approvalPolicy: this.config.codexApprovalPolicy,
             sandbox: this.config.codexSandbox,
             baseInstructions,
@@ -83,7 +85,7 @@ export class SessionManager {
     }
     const response = await this.codex.request<ThreadStartResponse>("thread/start", {
       cwd: this.config.codexWorkspace,
-      model: state.model ?? this.config.codexModel ?? null,
+      model,
       approvalPolicy: this.config.codexApprovalPolicy,
       sandbox: this.config.codexSandbox,
       baseInstructions,
@@ -104,7 +106,7 @@ export class SessionManager {
     if (this.activeTurn) {
       throw new Error("Codex is still processing the previous message. Use /interrupt if you want to stop it.");
     }
-    const state = await this.stateStore.read();
+    const { state, model } = await this.readStateWithSafeModel();
     const threadId = await this.ensureThread();
     const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
     if (this.config.bridgeSendBusyUpdates) {
@@ -116,7 +118,7 @@ export class SessionManager {
         threadId,
         input: [{ type: "text", text: input, text_elements: [] }],
         cwd: this.config.codexWorkspace,
-        model: state.model ?? this.config.codexModel ?? null,
+        model,
         effort: this.config.codexReasoningEffort ?? null,
         approvalPolicy: this.config.codexApprovalPolicy,
       });
@@ -273,6 +275,25 @@ export class SessionManager {
     this.activeTurn.lastEvent = event;
   }
 
+  private async readStateWithSafeModel(): Promise<{ state: BridgeState; model: string | null }> {
+    const state = await this.stateStore.read();
+    const safeStateModel = sanitizeCodexModel(state.model);
+    if (state.model && !safeStateModel) {
+      this.lastTurnError = "Rejected unsafe Codex model override from bridge state.";
+      await this.stateStore.write({ model: undefined, threadId: undefined, activeTurnId: undefined });
+      this.resumedThreads.clear();
+      const repairedState = await this.stateStore.read();
+      return {
+        state: repairedState,
+        model: sanitizeCodexModel(this.config.codexModel) ?? null,
+      };
+    }
+    return {
+      state,
+      model: safeStateModel ?? sanitizeCodexModel(this.config.codexModel) ?? null,
+    };
+  }
+
   private extractFinalText(params: Record<string, any>): string {
     const items = params.turn?.items;
     if (!Array.isArray(items)) return "";
@@ -405,9 +426,7 @@ function isCodexErrorText(text: string): boolean {
 }
 
 function sanitizeErrorMessage(message: string): string {
-  return message
-    .replace(/\b(eck|ecs)_[A-Za-z0-9_-]+/g, "$1_[redacted]")
-    .replace(/\b(?:deviceSecret|botSecret|token|password)=([^&\s]+)/gi, "$1=[redacted]");
+  return redactSensitiveText(message);
 }
 
 function summarizeRepairReason(err: unknown): string {

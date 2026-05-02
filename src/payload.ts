@@ -62,13 +62,13 @@ export function sanitizeInboundTextForCodex(text: string): { text: string; remov
 }
 
 export function isBridgeCommand(text: string): boolean {
-  const trimmed = text.trim();
+  const trimmed = commandLine(text);
   return /^\/(?:status|reset|interrupt|model|模型)(?:\s|$)/i.test(trimmed) ||
     /^!codex(?:\s+(?:status|reset|interrupt|model)(?:\s|$)|\s*$)/i.test(trimmed);
 }
 
 export function parseBridgeCommand(text: string): { name: string; args: string } {
-  const trimmed = text.trim();
+  const trimmed = commandLine(text);
   const codexMatch = trimmed.match(/^!codex(?:\s+(\S+)(?:\s+([\s\S]*))?)?$/i);
   if (codexMatch) {
     return {
@@ -82,4 +82,8 @@ export function parseBridgeCommand(text: string): { name: string; args: string }
     name: name === "模型" ? "model" : name,
     args: (match?.[2] ?? "").trim(),
   };
+}
+
+function commandLine(text: string): string {
+  return text.trim().split(/\r?\n/, 1)[0]?.trim() ?? "";
 }
