@@ -6,6 +6,7 @@ import type {
   ChannelPromptPolicyResponse,
   ChannelRegisterResponse,
   EClawCard,
+  SenderHint,
 } from "./types.js";
 
 export class EClawClient {
@@ -34,7 +35,11 @@ export class EClawClient {
     return this.post<ChannelBindResponse>("/api/channel/bind", body);
   }
 
-  async sendMessage(state: BridgeState, message: string, options: { card?: EClawCard; busy?: boolean } = {}): Promise<ChannelMessageResponse> {
+  async sendMessage(
+    state: BridgeState,
+    message: string,
+    options: { card?: EClawCard; busy?: boolean; senderHint?: SenderHint } = {},
+  ): Promise<ChannelMessageResponse> {
     if (!state.deviceId || state.entityId === undefined || !state.botSecret) {
       throw new Error("EClaw entity is not bound yet.");
     }
@@ -47,8 +52,31 @@ export class EClawClient {
       state: options.busy ? "BUSY" : "IDLE",
       message,
       ...(options.card && { card: options.card }),
+      ...(options.senderHint && { senderHint: options.senderHint }),
     };
     return this.post<ChannelMessageResponse>("/api/channel/message", body);
+  }
+
+  /**
+   * Fetch the EClaw smart-routing system prompt (issue EClaw#2285 Phase 1).
+   * Returns "" on any failure so callers can fail-open: an older server or a
+   * temporary outage shouldn't break message delivery.
+   *
+   * The policy is static across messages, so callers should cache the result
+   * for the lifetime of the bridge process.
+   */
+  async getRoutingPolicy(channel = "codex", lang = "en"): Promise<string> {
+    try {
+      const params = new URLSearchParams({ channel, lang });
+      const url = `${this.config.eclawApiBase}/api/channel/routing-policy?${params.toString()}`;
+      const res = await fetch(url);
+      if (!res.ok) return "";
+      const data = (await res.json().catch(() => ({}))) as { success?: boolean; policy?: string };
+      if (data.success === false || typeof data.policy !== "string") return "";
+      return data.policy.trim();
+    } catch {
+      return "";
+    }
   }
 
   async getPromptPolicy(state: BridgeState, channel = "codex"): Promise<ChannelPromptPolicyResponse | null> {

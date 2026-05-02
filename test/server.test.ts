@@ -33,6 +33,7 @@ function deps(): BridgeAppDeps {
     sessionManager: {
       status: () => ({ bufferedChars: 0 }),
       handleInbound: vi.fn().mockResolvedValue("Codex reply"),
+      sendCodexReply: vi.fn().mockResolvedValue(undefined),
       interrupt: vi.fn(),
       reset: vi.fn(),
     } as any,
@@ -56,7 +57,10 @@ describe("server", () => {
     expect(res.status).toBe(200);
     expect(d.sessionManager.handleInbound).toHaveBeenCalled();
     await vi.waitFor(() => {
-      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(expect.anything(), "Codex reply");
+      expect((d.sessionManager as any).sendCodexReply).toHaveBeenCalledWith(
+        expect.anything(),
+        "Codex reply",
+      );
     });
   });
 
@@ -70,6 +74,7 @@ describe("server", () => {
       .expect(200);
 
     await new Promise((resolve) => setTimeout(resolve, 0));
+    expect((d.sessionManager as any).sendCodexReply).not.toHaveBeenCalled();
     expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
   });
 

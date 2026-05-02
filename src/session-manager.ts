@@ -2,7 +2,13 @@ import type { CodexClient } from "./codex-client.js";
 import type { EClawClient } from "./eclaw-client.js";
 import { formatInboundForCodex } from "./payload.js";
 import type { StateStore } from "./state-store.js";
-import type { BridgeConfig, BridgeState, EClawInboundPayload, ServerNotificationMessage } from "./types.js";
+import type {
+  BridgeConfig,
+  BridgeState,
+  EClawInboundPayload,
+  SenderHint,
+  ServerNotificationMessage,
+} from "./types.js";
 
 type ThreadStartResponse = {
   thread?: { id?: string };
@@ -29,6 +35,9 @@ export class SessionManager {
   private activeTurn?: ActiveTurn;
   private readonly resumedThreads = new Set<string>();
   private lastTurnError?: string;
+  private lastSenderHint?: SenderHint;
+  /** Cached routing policy text (one network call per process). */
+  private routingPolicy?: string;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -80,7 +89,18 @@ export class SessionManager {
   }
 
   async handleInbound(payload: EClawInboundPayload): Promise<string> {
+    // Capture the sender so the eventual outbound reply (forwarded by
+    // sessionManager via eclaw.sendMessage) can pass senderHint to
+    // /api/channel/message. The server then resolves speakTo centrally —
+    // see EClaw#2285 Phase 3a. Bots-as-sender are mapped to kind=entity;
+    // real users / system events get kind=user (no routing).
+    this.lastSenderHint = deriveSenderHint(payload);
     return this.handleInboundOnce(payload, true);
+  }
+
+  /** Last-seen sender hint, exposed for tests / status surfaces. */
+  getLastSenderHint(): SenderHint | undefined {
+    return this.lastSenderHint;
   }
 
   private async handleInboundOnce(payload: EClawInboundPayload, retryOnMissingThread: boolean): Promise<string> {
@@ -91,6 +111,8 @@ export class SessionManager {
     const threadId = await this.ensureThread();
     const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
     if (this.config.bridgeSendBusyUpdates) {
+      // Busy updates are status-only — don't trigger speakTo via senderHint
+      // even when the inbound was bot-to-bot.
       await this.eclaw.sendMessage(state, "Codex is working...", { busy: true }).catch(() => undefined);
     }
     const input = formatInboundForCodex(payload);
@@ -284,13 +306,33 @@ export class SessionManager {
 
     const remotePolicy = await this.eclaw.getPromptPolicy(state, "codex").catch(() => null);
     const compiledPrompt = remotePolicy?.policy?.compiledPrompt?.trim();
-    if (!compiledPrompt) return localInstructions;
+    const routingPolicy = await this.fetchRoutingPolicyOnce();
 
-    return [
-      localInstructions,
-      "The following EClaw backend prompt policy is centrally managed and applies to this entity/channel:",
-      compiledPrompt,
-    ].join("\n\n");
+    const blocks: string[] = [localInstructions];
+    if (routingPolicy) {
+      blocks.push(
+        "EClaw central smart-routing policy (server-managed, EClaw#2285):",
+        routingPolicy,
+      );
+    }
+    if (compiledPrompt) {
+      blocks.push(
+        "The following EClaw backend prompt policy is centrally managed and applies to this entity/channel:",
+        compiledPrompt,
+      );
+    }
+    return blocks.join("\n\n");
+  }
+
+  /**
+   * Fetch the smart-routing policy once per process. The policy is static, so
+   * we cache the result in memory; a refresh requires a bridge restart. Fails
+   * open with "" so older servers (pre-EClaw#2287) don't break delivery.
+   */
+  private async fetchRoutingPolicyOnce(): Promise<string> {
+    if (this.routingPolicy !== undefined) return this.routingPolicy;
+    this.routingPolicy = await this.eclaw.getRoutingPolicy("codex", "en").catch(() => "");
+    return this.routingPolicy;
   }
 
   private async sendStopProgressUpdateIfRequired(state: BridgeState, reply: string): Promise<void> {
@@ -309,6 +351,16 @@ export class SessionManager {
       ].join("\n"),
       { busy: true },
     ).catch(() => undefined);
+  }
+
+  /**
+   * Send Codex's final answer to EClaw. Wraps `eclaw.sendMessage` so the
+   * captured senderHint from the most recent inbound is propagated, letting
+   * the EClaw server resolve speakTo centrally (EClaw#2285 Phase 3).
+   */
+  async sendCodexReply(state: BridgeState, reply: string, options: { card?: any } = {}): Promise<void> {
+    const senderHint = this.lastSenderHint;
+    await this.eclaw.sendMessage(state, reply, { ...options, ...(senderHint ? { senderHint } : {}) });
   }
 }
 
@@ -332,4 +384,32 @@ function describeItemEvent(item: any, fallback: string): string {
   if (item?.type) return `item:${item.type}`;
   if (item?.name) return `item:${item.name}`;
   return fallback;
+}
+
+/**
+ * Map an inbound payload to a SenderHint shaped for /api/channel/message.
+ *
+ * - bot-to-bot: payload.fromEntityId is the speaker → kind=entity
+ * - real user via /api/client/speak: payload.from === "client" → kind=user
+ * - system events (kanban, watchdog): payload.from === "system" → kind=user
+ *   (treated as no-routing: the system shows the reply through chat history,
+ *   not a directed @mention)
+ * - broadcast inbound: kind=broadcast — but only when explicitly flagged so
+ *   we don't accidentally re-broadcast every reply.
+ * - everything else: kind=unknown → no routing.
+ */
+export function deriveSenderHint(payload: EClawInboundPayload): SenderHint {
+  if (payload.isBroadcast) return { kind: "broadcast" };
+  const fromKey = (payload.from ?? "").toLowerCase();
+  if (fromKey === "client" || fromKey === "user" || fromKey === "system" || fromKey === "kanban") {
+    return { kind: "user" };
+  }
+  if (typeof payload.fromEntityId === "number" || typeof payload.fromPublicCode === "string") {
+    return {
+      kind: "entity",
+      ...(typeof payload.fromEntityId === "number" ? { entityId: payload.fromEntityId } : {}),
+      ...(payload.fromPublicCode ? { publicCode: payload.fromPublicCode } : {}),
+    };
+  }
+  return { kind: "unknown" };
 }

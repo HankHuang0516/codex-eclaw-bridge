@@ -47,6 +47,51 @@ describe("EClawClient", () => {
     }));
   });
 
+  it("forwards senderHint into the channel message body when provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EClawClient(config);
+    await client.sendMessage(
+      { deviceId: "dev", entityId: 2, botSecret: "secret" },
+      "reply",
+      { senderHint: { kind: "entity", entityId: 5, publicCode: "abc123" } },
+    );
+
+    const sentBody = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(sentBody.senderHint).toEqual({ kind: "entity", entityId: 5, publicCode: "abc123" });
+  });
+
+  it("getRoutingPolicy returns trimmed policy text on success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, policy: "  ROUTING block  " }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EClawClient(config);
+    const policy = await client.getRoutingPolicy("codex", "en");
+    expect(policy).toBe("ROUTING block");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://eclawbot.com/api/channel/routing-policy?channel=codex&lang=en",
+    );
+  });
+
+  it("getRoutingPolicy returns '' on 404 (older server pre-EClaw#2287)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => ({}) }));
+    const client = new EClawClient(config);
+    expect(await client.getRoutingPolicy()).toBe("");
+  });
+
+  it("getRoutingPolicy returns '' when fetch throws", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ENOTFOUND")));
+    const client = new EClawClient(config);
+    expect(await client.getRoutingPolicy()).toBe("");
+  });
+
   it("fetches centrally managed prompt policy for the bound entity", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

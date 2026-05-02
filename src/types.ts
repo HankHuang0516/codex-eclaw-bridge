@@ -38,6 +38,18 @@ export type BridgeState = {
   updatedAt?: string;
 };
 
+/**
+ * Smart-routing sender hint passed to /api/channel/message (and
+ * /api/transform). The EClaw server resolves this into speakTo / broadcast
+ * with the lowest precedence — explicit speakTo / broadcast and in-text
+ * @-mentions still win. See EClaw issue #2285.
+ */
+export type SenderHint = {
+  kind: "entity" | "user" | "broadcast" | "unknown";
+  entityId?: number;
+  publicCode?: string;
+};
+
 export type EClawInboundPayload = {
   event?: string;
   deviceId: string;
