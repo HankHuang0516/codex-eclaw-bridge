@@ -9,6 +9,7 @@ import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payl
 import { redactSensitiveText } from "./redact.js";
 import { SessionManager } from "./session-manager.js";
 import { StateStore } from "./state-store.js";
+import { ManagedTunnel } from "./tunnel-manager.js";
 import type { BridgeConfig, EClawCard, EClawInboundPayload } from "./types.js";
 
 const MODEL_PICKER_ASK_ID = "codex_model_picker";
@@ -25,6 +26,7 @@ const REASONING_OPTIONS = [
   { id: "high", label: "高", style: "secondary" },
   { id: "xhigh", label: "超高", style: "secondary" },
 ] as const;
+const MANAGED_TUNNEL_REGISTER_ATTEMPTS = 20;
 
 export type BridgeAppDeps = {
   config: BridgeConfig;
@@ -33,7 +35,26 @@ export type BridgeAppDeps = {
   stateStore: StateStore;
   sessionManager: SessionManager;
   approvalRouter: ApprovalRouter;
+  tunnelManager?: ManagedTunnel;
+  publicWebhookMonitor?: PublicWebhookMonitor;
 };
+
+export type PublicWebhookMonitor = {
+  lastCheckedAt: number;
+  lastAlertAt: number;
+  lastFailure?: string;
+};
+
+export type PublicWebhookHealth = {
+  ok: boolean;
+  url: string;
+  status?: number;
+  error?: string;
+};
+
+export function createPublicWebhookMonitor(): PublicWebhookMonitor {
+  return { lastCheckedAt: 0, lastAlertAt: 0 };
+}
 
 export function createApp(deps: BridgeAppDeps): express.Express {
   const app = express();
@@ -62,6 +83,18 @@ export function createApp(deps: BridgeAppDeps): express.Express {
       codex: deps.codex.status(),
       session: deps.sessionManager.status(),
       approvals: deps.approvalRouter.status(),
+      tunnel: deps.tunnelManager?.status(),
+      publicWebhook: deps.publicWebhookMonitor
+        ? {
+            lastCheckedAt: deps.publicWebhookMonitor.lastCheckedAt
+              ? new Date(deps.publicWebhookMonitor.lastCheckedAt).toISOString()
+              : undefined,
+            lastAlertAt: deps.publicWebhookMonitor.lastAlertAt
+              ? new Date(deps.publicWebhookMonitor.lastAlertAt).toISOString()
+              : undefined,
+            lastFailure: deps.publicWebhookMonitor.lastFailure,
+          }
+        : undefined,
     });
   });
 
@@ -130,6 +163,10 @@ export async function bootstrap(): Promise<void> {
   const eclaw = new EClawClient(config);
   const codex = new CodexClient(config);
   await codex.start();
+  const tunnelManager = config.bridgeManagedTunnelEnabled ? new ManagedTunnel(config) : undefined;
+  if (tunnelManager) {
+    config.eclawWebhookUrl = await tunnelManager.ensureStarted();
+  }
 
   const sessionManager = new SessionManager(config, codex, eclaw, stateStore);
   const approvalRouter = new ApprovalRouter(config, codex, eclaw, stateStore);
@@ -141,11 +178,27 @@ export async function bootstrap(): Promise<void> {
     }
   });
 
-  await registerAndBind(eclaw, stateStore);
+  try {
+    await registerAndBindWithRetry(eclaw, stateStore, config.bridgeManagedTunnelEnabled ? MANAGED_TUNNEL_REGISTER_ATTEMPTS : 1);
+  } catch (err) {
+    await tunnelManager?.stop().catch(() => undefined);
+    await codex.stop().catch(() => undefined);
+    throw err;
+  }
 
-  const app = createApp({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
-  const heartbeat = startStatusHeartbeat({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
-  const watchdog = startWatchdog({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
+  const deps = {
+    config,
+    codex,
+    eclaw,
+    stateStore,
+    sessionManager,
+    approvalRouter,
+    tunnelManager,
+    publicWebhookMonitor: createPublicWebhookMonitor(),
+  };
+  const app = createApp(deps);
+  const heartbeat = startStatusHeartbeat(deps);
+  const watchdog = startWatchdog(deps);
   app.listen(config.eclawWebhookPort, () => {
     console.log(`[bridge] listening on http://localhost:${config.eclawWebhookPort}`);
     console.log(`[bridge] public webhook: ${config.eclawWebhookUrl}/eclaw-webhook`);
@@ -155,6 +208,7 @@ export async function bootstrap(): Promise<void> {
     if (heartbeat) clearInterval(heartbeat);
     if (watchdog) clearInterval(watchdog);
     await eclaw.unregisterCallback().catch(() => undefined);
+    await tunnelManager?.stop().catch(() => undefined);
     await codex.stop();
     process.exit(0);
   };
@@ -182,6 +236,8 @@ export function startWatchdog(deps: BridgeAppDeps): NodeJS.Timeout | undefined {
 }
 
 export async function runWatchdog(deps: BridgeAppDeps): Promise<boolean> {
+  if (await runPublicWebhookWatchdog(deps)) return true;
+
   if (!deps.codex.status().connected) {
     await deps.codex.restart();
     const state = await deps.stateStore.read();
@@ -203,6 +259,76 @@ export async function runWatchdog(deps: BridgeAppDeps): Promise<boolean> {
 
   await deps.sessionManager.recoverStalledTurn(`No Codex activity for ${formatElapsed(idleMs)}.`);
   return true;
+}
+
+export async function runPublicWebhookWatchdog(deps: BridgeAppDeps): Promise<boolean> {
+  if (!deps.config.bridgePublicWebhookWatchdogEnabled || !deps.publicWebhookMonitor) return false;
+
+  const now = Date.now();
+  if (now - deps.publicWebhookMonitor.lastCheckedAt < deps.config.bridgePublicWebhookWatchdogMs) {
+    return false;
+  }
+  deps.publicWebhookMonitor.lastCheckedAt = now;
+
+  const health = await checkPublicWebhookHealth(deps.config);
+  if (health.ok) {
+    deps.publicWebhookMonitor.lastFailure = undefined;
+    return false;
+  }
+
+  deps.publicWebhookMonitor.lastFailure = health.error ?? `HTTP ${health.status ?? "unknown"}`;
+  if (deps.tunnelManager && deps.config.bridgeManagedTunnelEnabled) {
+    const previousUrl = deps.config.eclawWebhookUrl;
+    const nextUrl = await deps.tunnelManager.restart();
+    deps.config.eclawWebhookUrl = nextUrl;
+    await registerAndBindWithRetry(deps.eclaw, deps.stateStore, MANAGED_TUNNEL_REGISTER_ATTEMPTS);
+    const state = await deps.stateStore.read();
+    await deps.eclaw.sendMessage(state, [
+      "Codex watchdog self-repair",
+      "- Trigger: public webhook health check failed.",
+      `- Previous URL: ${previousUrl}`,
+      `- New URL: ${nextUrl}`,
+      "- Action: restarted managed tunnel and re-registered EClaw callback.",
+    ].join("\n"), { busy: true }).catch(() => undefined);
+    deps.publicWebhookMonitor.lastFailure = undefined;
+    return true;
+  }
+
+  const alertCooldownMs = Math.max(600_000, deps.config.bridgePublicWebhookWatchdogMs);
+  if (now - deps.publicWebhookMonitor.lastAlertAt >= alertCooldownMs) {
+    deps.publicWebhookMonitor.lastAlertAt = now;
+    const state = await deps.stateStore.read();
+    await deps.eclaw.sendMessage(state, [
+      "Codex watchdog needs operator action",
+      "- Trigger: public webhook health check failed.",
+      `- URL: ${deps.config.eclawWebhookUrl}`,
+      `- Reason: ${deps.publicWebhookMonitor.lastFailure}`,
+      "- Action needed: restart the public tunnel or enable BRIDGE_MANAGED_TUNNEL_ENABLED=true.",
+    ].join("\n"), { busy: true }).catch(() => undefined);
+  }
+
+  return false;
+}
+
+export async function checkPublicWebhookHealth(config: BridgeConfig): Promise<PublicWebhookHealth> {
+  const url = `${config.eclawWebhookUrl}/health`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.bridgePublicWebhookTimeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return { ok: false, url, status: res.status, error: `HTTP ${res.status}` };
+    }
+    return { ok: true, url, status: res.status };
+  } catch (err: any) {
+    return { ok: false, url, error: sanitizeHealthError(err) };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean> {
@@ -248,6 +374,10 @@ function formatElapsed(ms: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function registerAndBind(eclaw: EClawClient, stateStore: StateStore): Promise<void> {
   const registration = await eclaw.registerCallback();
   const binding = await eclaw.bindEntity();
@@ -258,6 +388,26 @@ export async function registerAndBind(eclaw: EClawClient, stateStore: StateStore
     botSecret: binding.botSecret,
     publicCode: binding.publicCode,
   });
+}
+
+export async function registerAndBindWithRetry(eclaw: EClawClient, stateStore: StateStore, attempts: number): Promise<void> {
+  let lastError: any;
+  const totalAttempts = Math.max(1, attempts);
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    try {
+      await registerAndBind(eclaw, stateStore);
+      return;
+    } catch (err: any) {
+      lastError = err;
+      if (attempt >= totalAttempts) break;
+      const waitMs = Math.min(2_000 * attempt, 10_000);
+      console.warn(
+        `[bridge] register/bind attempt ${attempt}/${totalAttempts} failed; retrying in ${waitMs}ms: ${sanitizeHealthError(err)}`,
+      );
+      await delay(waitMs);
+    }
+  }
+  throw lastError;
 }
 
 export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawInboundPayload): Promise<void> {
@@ -510,6 +660,13 @@ function formatBridgeError(err: any): string {
     `- Reason: ${message}`,
     "- Next: send `!codex status`, `!codex reset`, or retry the task.",
   ].join("\n");
+}
+
+function sanitizeHealthError(err: any): string {
+  const raw = err?.message ? String(err.message) : String(err ?? "unknown health check error");
+  return redactSensitiveText(raw)
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
 }
 
 function redactState(state: Record<string, unknown>): Record<string, unknown> {

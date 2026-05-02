@@ -25,6 +25,13 @@ export type BridgeConfig = {
   bridgeStatusHeartbeatMs: number;
   bridgeWatchdogEnabled: boolean;
   bridgeWatchdogStallMs: number;
+  bridgePublicWebhookWatchdogEnabled: boolean;
+  bridgePublicWebhookWatchdogMs: number;
+  bridgePublicWebhookTimeoutMs: number;
+  bridgeManagedTunnelEnabled: boolean;
+  bridgeTunnelBin: string;
+  bridgeTunnelTargetUrl: string;
+  bridgeTunnelReadyTimeoutMs: number;
 };
 
 export type BridgeState = {

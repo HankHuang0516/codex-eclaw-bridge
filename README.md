@@ -114,6 +114,13 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `BRIDGE_STATUS_HEARTBEAT_MS` |  | `180000` | Status heartbeat interval |
 | `BRIDGE_WATCHDOG_ENABLED` |  | `true` | Restart/retry recoverable Codex bridge failures automatically |
 | `BRIDGE_WATCHDOG_STALL_MS` |  | `480000` | Turn idle threshold before watchdog recovery |
+| `BRIDGE_PUBLIC_WEBHOOK_WATCHDOG_ENABLED` |  | `true` | Check the public webhook `/health` route so stale tunnels are detected |
+| `BRIDGE_PUBLIC_WEBHOOK_WATCHDOG_MS` |  | `120000` | Public webhook health-check interval |
+| `BRIDGE_PUBLIC_WEBHOOK_TIMEOUT_MS` |  | `10000` | Public webhook health-check timeout |
+| `BRIDGE_MANAGED_TUNNEL_ENABLED` |  | `false` | Let the bridge own a Cloudflare Quick Tunnel and re-register EClaw when it changes |
+| `BRIDGE_TUNNEL_BIN` |  | `cloudflared` | Tunnel binary used when managed tunnel mode is enabled |
+| `BRIDGE_TUNNEL_TARGET_URL` |  | `http://localhost:${ECLAW_WEBHOOK_PORT}` | Local URL exposed by the managed tunnel |
+| `BRIDGE_TUNNEL_READY_TIMEOUT_MS` |  | `45000` | Time to wait for cloudflared to print a public URL |
 | `BRIDGE_REQUIRE_CALLBACK_AUTH` |  | `false` | Require configured callback auth |
 
 Never commit `.env`. `.gitignore` excludes `.env*` except `.env.example`.
@@ -155,6 +162,13 @@ The watchdog is separate from the heartbeat. It restarts the Codex app-server if
 the websocket disconnects, resets the thread and retries once for recoverable
 Codex request failures, and interrupts/retries turns that stop producing events
 longer than `BRIDGE_WATCHDOG_STALL_MS` while no approval card is pending.
+
+It also checks `${ECLAW_WEBHOOK_URL}/health`. If that public URL dies and the
+bridge owns the tunnel (`BRIDGE_MANAGED_TUNNEL_ENABLED=true`), the watchdog
+restarts `cloudflared`, updates the runtime webhook URL, and re-registers the
+EClaw callback. Without managed tunnel mode, it sends an operator-action alert
+through EClaw so stale Quick Tunnel URLs are visible instead of looking like a
+silent Codex failure.
 
 ## Central Prompt Policy
 

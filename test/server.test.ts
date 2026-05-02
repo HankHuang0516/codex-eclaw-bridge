@@ -1,6 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import request from "supertest";
-import { buildStatusHeartbeatMessage, createApp, runWatchdog, sendStatusHeartbeat } from "../src/server.js";
+import {
+  buildStatusHeartbeatMessage,
+  createApp,
+  createPublicWebhookMonitor,
+  runPublicWebhookWatchdog,
+  runWatchdog,
+  sendStatusHeartbeat,
+} from "../src/server.js";
 import type { BridgeAppDeps } from "../src/server.js";
 import type { BridgeConfig } from "../src/types.js";
 
@@ -24,13 +31,30 @@ const config: BridgeConfig = {
   bridgeStatusHeartbeatMs: 180000,
   bridgeWatchdogEnabled: true,
   bridgeWatchdogStallMs: 480000,
+  bridgePublicWebhookWatchdogEnabled: true,
+  bridgePublicWebhookWatchdogMs: 120000,
+  bridgePublicWebhookTimeoutMs: 10000,
+  bridgeManagedTunnelEnabled: false,
+  bridgeTunnelBin: "cloudflared",
+  bridgeTunnelTargetUrl: "http://localhost:18800",
+  bridgeTunnelReadyTimeoutMs: 45000,
 };
 
 function deps(): BridgeAppDeps {
   return {
-    config,
+    config: { ...config },
     codex: { status: () => ({ connected: true }), restart: vi.fn().mockResolvedValue(undefined) } as any,
-    eclaw: { sendMessage: vi.fn().mockResolvedValue({ success: true }) } as any,
+    eclaw: {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      registerCallback: vi.fn().mockResolvedValue({ success: true, accountId: 1, deviceId: "dev" }),
+      bindEntity: vi.fn().mockResolvedValue({
+        success: true,
+        deviceId: "dev",
+        entityId: 1,
+        botSecret: "secret",
+        publicCode: "abc123",
+      }),
+    } as any,
     stateStore: { read: vi.fn().mockResolvedValue({ deviceId: "dev", entityId: 1, botSecret: "secret" }), write: vi.fn() } as any,
     sessionManager: {
       status: () => ({ bufferedChars: 0 }),
@@ -49,6 +73,10 @@ function deps(): BridgeAppDeps {
 }
 
 describe("server", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("handles inbound webhook and sends reply", async () => {
     const d = deps();
     const app = createApp(d);
@@ -324,6 +352,50 @@ describe("server", () => {
 
     await expect(runWatchdog(d)).resolves.toBe(true);
     expect(d.sessionManager.recoverStalledTurn).toHaveBeenCalledWith(expect.stringContaining("No Codex activity"));
+  });
+
+  it("watchdog restarts a managed tunnel and re-registers callback when public webhook dies", async () => {
+    const d = deps();
+    d.config.bridgeManagedTunnelEnabled = true;
+    d.config.eclawWebhookUrl = "https://stale.trycloudflare.com";
+    d.publicWebhookMonitor = createPublicWebhookMonitor();
+    const tunnelManager = {
+      restart: vi.fn().mockResolvedValue("https://fresh.trycloudflare.com"),
+      status: vi.fn(),
+    } as any;
+    d.tunnelManager = tunnelManager;
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("getaddrinfo ENOTFOUND stale.trycloudflare.com")));
+
+    await expect(runPublicWebhookWatchdog(d)).resolves.toBe(true);
+
+    expect(tunnelManager.restart).toHaveBeenCalled();
+    expect(d.config.eclawWebhookUrl).toBe("https://fresh.trycloudflare.com");
+    expect(d.eclaw.registerCallback).toHaveBeenCalled();
+    expect(d.eclaw.bindEntity).toHaveBeenCalled();
+    expect(d.stateStore.write).toHaveBeenCalledWith(expect.objectContaining({
+      deviceId: "dev",
+      entityId: 1,
+      botSecret: "secret",
+    }));
+    expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("restarted managed tunnel"),
+      { busy: true },
+    );
+  });
+
+  it("watchdog alerts when public webhook dies without a managed tunnel", async () => {
+    const d = deps();
+    d.publicWebhookMonitor = createPublicWebhookMonitor();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("getaddrinfo ENOTFOUND stale.trycloudflare.com")));
+
+    await expect(runPublicWebhookWatchdog(d)).resolves.toBe(false);
+
+    expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("public webhook health check failed"),
+      { busy: true },
+    );
   });
 
   it("supports local /ask diagnostics without sending to EClaw", async () => {
