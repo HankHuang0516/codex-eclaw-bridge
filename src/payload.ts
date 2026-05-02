@@ -63,8 +63,8 @@ export function sanitizeInboundTextForCodex(text: string): { text: string; remov
 
 export function isBridgeCommand(text: string): boolean {
   const trimmed = commandLine(text);
-  return /^\/(?:status|reset|interrupt|model|模型)(?:\s|$)/i.test(trimmed) ||
-    /^!codex(?:\s+(?:status|reset|interrupt|model)(?:\s|$)|\s*$)/i.test(trimmed);
+  return /^\/(?:status|reset|interrupt|model|模型|effort|reasoning|智慧)(?:\s|$)/i.test(trimmed) ||
+    /^!codex(?:\s+(?:status|reset|interrupt|model|effort|reasoning)(?:\s|$)|\s*$)/i.test(trimmed);
 }
 
 export function parseBridgeCommand(text: string): { name: string; args: string } {
@@ -79,9 +79,15 @@ export function parseBridgeCommand(text: string): { name: string; args: string }
   const match = trimmed.match(/^\/(\S+)(?:\s+([\s\S]*))?$/);
   const name = (match?.[1] ?? "").toLowerCase();
   return {
-    name: name === "模型" ? "model" : name,
+    name: normalizeBridgeCommandName(name),
     args: (match?.[2] ?? "").trim(),
   };
+}
+
+function normalizeBridgeCommandName(name: string): string {
+  if (name === "模型") return "model";
+  if (name === "智慧") return "effort";
+  return name;
 }
 
 function commandLine(text: string): string {

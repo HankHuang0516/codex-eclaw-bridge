@@ -85,10 +85,13 @@ describe("server", () => {
       .expect(200);
 
     expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
-    expect(d.eclaw.sendMessage).toHaveBeenCalled();
+    expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("- Intelligence: (default)"),
+    );
   });
 
-  it("sends a rich model picker for /model without args", async () => {
+  it("sends rich model and intelligence pickers for /model without args", async () => {
     const d = deps();
     const app = createApp(d);
     await request(app)
@@ -106,6 +109,22 @@ describe("server", () => {
             ask_id: "codex_model_picker",
             buttons: expect.arrayContaining([
               expect.objectContaining({ id: "model:gpt-5.4-mini" }),
+            ]),
+          }),
+        }),
+      );
+      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining("選擇 Codex 智慧功能等級"),
+        expect.objectContaining({
+          card: expect.objectContaining({
+            ask_id: "codex_reasoning_picker",
+            title: "Codex 智慧功能",
+            buttons: expect.arrayContaining([
+              expect.objectContaining({ id: "effort:low", label: "低" }),
+              expect.objectContaining({ id: "effort:medium", label: "中" }),
+              expect.objectContaining({ id: "effort:high", label: "高" }),
+              expect.objectContaining({ id: "effort:xhigh", label: "超高" }),
             ]),
           }),
         }),
@@ -134,6 +153,54 @@ describe("server", () => {
       expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
         expect.anything(),
         "Codex model set to gpt-5.4-mini. New turns will use a fresh thread.",
+      );
+      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining("選擇 Codex 智慧功能等級"),
+        expect.objectContaining({ card: expect.objectContaining({ ask_id: "codex_reasoning_picker" }) }),
+      );
+    });
+  });
+
+  it("applies intelligence picker card actions and resets the thread", async () => {
+    const d = deps();
+    const app = createApp(d);
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({
+        event: "card_action",
+        deviceId: "dev",
+        entityId: 1,
+        ask_id: "codex_reasoning_picker",
+        action_id: "effort:high",
+      })
+      .expect(200);
+
+    expect(d.stateStore.write).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(d.sessionManager.reset).toHaveBeenCalled();
+    expect(d.sessionManager.handleInbound).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        "Codex intelligence set to 高 (high). New turns will use a fresh thread.",
+      );
+    });
+  });
+
+  it("supports /智慧 commands for intelligence selection", async () => {
+    const d = deps();
+    const app = createApp(d);
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({ deviceId: "dev", entityId: 1, text: "/智慧 超高" })
+      .expect(200);
+
+    expect(d.stateStore.write).toHaveBeenCalledWith({ reasoningEffort: "xhigh" });
+    expect(d.sessionManager.reset).toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(d.eclaw.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        "Codex intelligence set to 超高 (xhigh). New turns will use a fresh thread.",
       );
     });
   });

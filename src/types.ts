@@ -35,6 +35,7 @@ export type BridgeState = {
   publicCode?: string;
   threadId?: string;
   model?: string;
+  reasoningEffort?: string;
   activeTurnId?: string;
   startedAt?: string;
   updatedAt?: string;

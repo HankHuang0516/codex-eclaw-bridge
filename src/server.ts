@@ -4,7 +4,7 @@ import { loadConfig } from "./config.js";
 import { CodexClient } from "./codex-client.js";
 import { EClawClient } from "./eclaw-client.js";
 import { ApprovalRouter } from "./approval-router.js";
-import { sanitizeCodexModel } from "./model.js";
+import { sanitizeCodexModel, sanitizeCodexReasoningEffort } from "./model.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
 import { redactSensitiveText } from "./redact.js";
 import { SessionManager } from "./session-manager.js";
@@ -12,11 +12,18 @@ import { StateStore } from "./state-store.js";
 import type { BridgeConfig, EClawCard, EClawInboundPayload } from "./types.js";
 
 const MODEL_PICKER_ASK_ID = "codex_model_picker";
+const REASONING_PICKER_ASK_ID = "codex_reasoning_picker";
 const MODEL_OPTIONS = [
   { id: "gpt-5.5", label: "GPT-5.5", style: "primary" },
   { id: "gpt-5.4", label: "GPT-5.4", style: "secondary" },
   { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", style: "secondary" },
   { id: "gpt-5.3-codex", label: "GPT-5.3 Codex", style: "secondary" },
+] as const;
+const REASONING_OPTIONS = [
+  { id: "low", label: "低", style: "secondary" },
+  { id: "medium", label: "中", style: "primary" },
+  { id: "high", label: "高", style: "secondary" },
+  { id: "xhigh", label: "超高", style: "secondary" },
 ] as const;
 
 export type BridgeAppDeps = {
@@ -284,6 +291,8 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
       "Codex bridge status",
       `- Codex connected: ${deps.codex.status().connected}`,
       `- Thread: ${state.threadId ?? "(none)"}`,
+      `- Model: ${sanitizeCodexModel(state.model) ?? sanitizeCodexModel(deps.config.codexModel) ?? "(default)"}`,
+      `- Intelligence: ${reasoningLabel(currentReasoningEffort(state, deps.config))}`,
       `- Active turn: ${deps.sessionManager.status().activeTurnId ?? "(none)"}`,
       `- Pending approvals: ${deps.approvalRouter.status().pending}`,
       `- Last Codex error: ${deps.sessionManager.status().lastTurnError ?? "(none)"}`,
@@ -303,9 +312,13 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
   }
   if (command.name === "model") {
     const currentModel = sanitizeCodexModel(state.model) ?? sanitizeCodexModel(deps.config.codexModel);
+    const currentEffort = currentReasoningEffort(state, deps.config);
     if (!command.args) {
       await deps.eclaw.sendMessage(state, modelPickerBody(currentModel), {
         card: modelPickerCard(currentModel),
+      });
+      await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
+        card: reasoningPickerCard(currentEffort),
       });
       return;
     }
@@ -315,23 +328,69 @@ async function handleBridgeCommand(deps: BridgeAppDeps, text: string): Promise<v
       return;
     }
     await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${model}. New turns will use a fresh thread.`);
+    const nextState = await deps.stateStore.read();
+    const nextEffort = currentReasoningEffort(nextState, deps.config);
+    await deps.eclaw.sendMessage(nextState, reasoningPickerBody(nextEffort), {
+      card: reasoningPickerCard(nextEffort),
+    });
+    return;
+  }
+  if (command.name === "effort" || command.name === "reasoning") {
+    if (!command.args) {
+      const currentEffort = currentReasoningEffort(state, deps.config);
+      await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
+        card: reasoningPickerCard(currentEffort),
+      });
+      return;
+    }
+    const effort = await setCodexReasoningEffort(deps, command.args);
+    if (!effort) {
+      await deps.eclaw.sendMessage(state, "Invalid Codex intelligence value. Use `low`, `medium`, `high`, `xhigh`, or `低` / `中` / `高` / `超高`.");
+      return;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(effort)} (${effort}). New turns will use a fresh thread.`);
+    return;
   }
 }
 
 async function handleModelPickerAction(deps: BridgeAppDeps, payload: EClawInboundPayload): Promise<boolean> {
   if (payload.event !== "card_action") return false;
-  if (payload.ask_id !== MODEL_PICKER_ASK_ID) return false;
   const actionId = payload.action_id ?? "";
-  if (!actionId.startsWith("model:")) return false;
+  if (payload.ask_id === MODEL_PICKER_ASK_ID) {
+    if (!actionId.startsWith("model:")) return false;
 
-  const model = actionId.slice("model:".length).trim();
-  if (!MODEL_OPTIONS.some((option) => option.id === model)) {
-    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`);
+    const model = actionId.slice("model:".length).trim();
+    if (!MODEL_OPTIONS.some((option) => option.id === model)) {
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex model option: ${model}`);
+      return true;
+    }
+    const safeModel = await setCodexModel(deps, model);
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${safeModel}. New turns will use a fresh thread.`);
+    const state = await deps.stateStore.read();
+    const currentEffort = currentReasoningEffort(state, deps.config);
+    await deps.eclaw.sendMessage(state, reasoningPickerBody(currentEffort), {
+      card: reasoningPickerCard(currentEffort),
+    });
     return true;
   }
-  const safeModel = await setCodexModel(deps, model);
-  await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex model set to ${safeModel}. New turns will use a fresh thread.`);
-  return true;
+
+  if (payload.ask_id === REASONING_PICKER_ASK_ID) {
+    if (!actionId.startsWith("effort:")) return false;
+    const effort = actionId.slice("effort:".length).trim();
+    if (!REASONING_OPTIONS.some((option) => option.id === effort)) {
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`);
+      return true;
+    }
+    const safeEffort = await setCodexReasoningEffort(deps, effort);
+    if (!safeEffort) {
+      await deps.eclaw.sendMessage(await deps.stateStore.read(), `Unknown Codex intelligence option: ${effort}`);
+      return true;
+    }
+    await deps.eclaw.sendMessage(await deps.stateStore.read(), `Codex intelligence set to ${reasoningLabel(safeEffort)} (${safeEffort}). New turns will use a fresh thread.`);
+    return true;
+  }
+
+  return false;
 }
 
 async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<string | undefined> {
@@ -340,6 +399,14 @@ async function setCodexModel(deps: BridgeAppDeps, model: string): Promise<string
   await deps.stateStore.write({ model: safeModel });
   await deps.sessionManager.reset();
   return safeModel;
+}
+
+async function setCodexReasoningEffort(deps: BridgeAppDeps, effort: string): Promise<string | undefined> {
+  const safeEffort = sanitizeCodexReasoningEffort(effort);
+  if (!safeEffort) return undefined;
+  await deps.stateStore.write({ reasoningEffort: safeEffort });
+  await deps.sessionManager.reset();
+  return safeEffort;
 }
 
 function modelPickerBody(currentModel?: string): string {
@@ -362,6 +429,40 @@ function modelPickerCard(currentModel?: string): EClawCard {
       style: option.style,
     })),
   };
+}
+
+function reasoningPickerBody(currentEffort?: string): string {
+  return [
+    "選擇 Codex 智慧功能等級，會套用到之後的新對話。",
+    `目前智慧功能：${reasoningLabel(currentEffort)}`,
+    "",
+    "低較快，中較平衡，高/超高會在複雜工作上投入更多推理。",
+  ].join("\n");
+}
+
+function reasoningPickerCard(currentEffort?: string): EClawCard {
+  return {
+    ask_id: REASONING_PICKER_ASK_ID,
+    title: "Codex 智慧功能",
+    body: `目前：${reasoningLabel(currentEffort)}`,
+    buttons: REASONING_OPTIONS.map((option) => ({
+      id: `effort:${option.id}`,
+      label: option.label,
+      style: option.id === currentEffort ? "primary" : option.style,
+    })),
+  };
+}
+
+function reasoningLabel(effort?: string): string {
+  if (effort === "low") return "低";
+  if (effort === "medium") return "中";
+  if (effort === "high") return "高";
+  if (effort === "xhigh") return "超高";
+  return "(default)";
+}
+
+function currentReasoningEffort(state: { reasoningEffort?: string }, config: BridgeConfig): string | undefined {
+  return sanitizeCodexReasoningEffort(state.reasoningEffort) ?? sanitizeCodexReasoningEffort(config.codexReasoningEffort);
 }
 
 function verifyCallbackAuth(config: BridgeConfig) {

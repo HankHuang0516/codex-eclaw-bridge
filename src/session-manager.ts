@@ -1,6 +1,6 @@
 import type { CodexClient } from "./codex-client.js";
 import type { EClawClient } from "./eclaw-client.js";
-import { sanitizeCodexModel } from "./model.js";
+import { sanitizeCodexModel, sanitizeCodexReasoningEffort } from "./model.js";
 import { formatInboundForCodex } from "./payload.js";
 import { redactSensitiveText } from "./redact.js";
 import type { StateStore } from "./state-store.js";
@@ -59,7 +59,7 @@ export class SessionManager {
   }
 
   async ensureThread(): Promise<string> {
-    const { state, model } = await this.readStateWithSafeModel();
+    const { state, model } = await this.readStateWithSafeSettings();
     const baseInstructions = await this.baseInstructions(state);
     if (state.threadId) {
       if (!this.resumedThreads.has(state.threadId)) {
@@ -106,7 +106,7 @@ export class SessionManager {
     if (this.activeTurn) {
       throw new Error("Codex is still processing the previous message. Use /interrupt if you want to stop it.");
     }
-    const { state, model } = await this.readStateWithSafeModel();
+    const { state, model, effort } = await this.readStateWithSafeSettings();
     const threadId = await this.ensureThread();
     const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
     if (this.config.bridgeSendBusyUpdates) {
@@ -119,7 +119,7 @@ export class SessionManager {
         input: [{ type: "text", text: input, text_elements: [] }],
         cwd: this.config.codexWorkspace,
         model,
-        effort: this.config.codexReasoningEffort ?? null,
+        effort,
         approvalPolicy: this.config.codexApprovalPolicy,
       });
       const turnId = response.turn?.id;
@@ -275,22 +275,25 @@ export class SessionManager {
     this.activeTurn.lastEvent = event;
   }
 
-  private async readStateWithSafeModel(): Promise<{ state: BridgeState; model: string | null }> {
+  private async readStateWithSafeSettings(): Promise<{ state: BridgeState; model: string | null; effort: string | null }> {
     const state = await this.stateStore.read();
     const safeStateModel = sanitizeCodexModel(state.model);
-    if (state.model && !safeStateModel) {
-      this.lastTurnError = "Rejected unsafe Codex model override from bridge state.";
-      await this.stateStore.write({ model: undefined, threadId: undefined, activeTurnId: undefined });
+    const safeStateEffort = sanitizeCodexReasoningEffort(state.reasoningEffort);
+    if ((state.model && !safeStateModel) || (state.reasoningEffort && !safeStateEffort)) {
+      this.lastTurnError = "Rejected unsafe Codex model or reasoning override from bridge state.";
+      await this.stateStore.write({ model: safeStateModel, reasoningEffort: safeStateEffort, threadId: undefined, activeTurnId: undefined });
       this.resumedThreads.clear();
       const repairedState = await this.stateStore.read();
       return {
         state: repairedState,
         model: sanitizeCodexModel(this.config.codexModel) ?? null,
+        effort: sanitizeCodexReasoningEffort(this.config.codexReasoningEffort) ?? null,
       };
     }
     return {
       state,
       model: safeStateModel ?? sanitizeCodexModel(this.config.codexModel) ?? null,
+      effort: safeStateEffort ?? sanitizeCodexReasoningEffort(this.config.codexReasoningEffort) ?? null,
     };
   }
 

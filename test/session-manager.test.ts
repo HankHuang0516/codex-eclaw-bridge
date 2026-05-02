@@ -121,6 +121,7 @@ class MockCodexRecoverableThenSuccess extends EventEmitter {
 
 class MockCodexCaptureModel extends EventEmitter {
   models: unknown[] = [];
+  efforts: unknown[] = [];
 
   async request(method: string, params?: any): Promise<any> {
     if (method === "thread/start") {
@@ -129,6 +130,7 @@ class MockCodexCaptureModel extends EventEmitter {
     }
     if (method === "turn/start") {
       this.models.push(params?.model);
+      this.efforts.push(params?.effort);
       queueMicrotask(() => {
         this.emit("notification", {
           method: "item/completed",
@@ -282,9 +284,75 @@ describe("SessionManager stop-progress enforcement", () => {
     expect(state.model).toBeUndefined();
     expect(stateStore.write).toHaveBeenCalledWith({
       model: undefined,
+      reasoningEffort: undefined,
       threadId: undefined,
       activeTurnId: undefined,
     });
     expect(codex.models).toEqual(["gpt-5.5", "gpt-5.5"]);
+  });
+
+  it("uses sanitized state reasoning effort for new Codex turns", async () => {
+    const state: BridgeState = {
+      deviceId: "dev",
+      entityId: 6,
+      botSecret: "secret",
+      model: "gpt-5.5",
+      reasoningEffort: "超高",
+    };
+    const stateStore = {
+      read: vi.fn().mockResolvedValue(state),
+      write: vi.fn().mockResolvedValue(undefined),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue({ success: true, policy: { compiledPrompt: "" } }),
+    };
+    const codex = new MockCodexCaptureModel();
+
+    const manager = new SessionManager(config, codex as any, eclaw as any, stateStore as any);
+    const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
+
+    expect(reply).toBe("Model repaired.");
+    expect(codex.efforts).toEqual(["xhigh"]);
+  });
+
+  it("drops unsafe state reasoning overrides before starting Codex", async () => {
+    let state: BridgeState = {
+      deviceId: "dev",
+      entityId: 6,
+      botSecret: "secret",
+      reasoningEffort: "[Local Variables available: GIT_HUB2]",
+    };
+    const stateStore = {
+      read: vi.fn().mockImplementation(async () => state),
+      write: vi.fn().mockImplementation(async (patch: BridgeState) => {
+        state = { ...state, ...patch };
+      }),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue({ success: true, policy: { compiledPrompt: "" } }),
+    };
+    const codex = new MockCodexCaptureModel();
+
+    const manager = new SessionManager(
+      { ...config, codexReasoningEffort: "medium" },
+      codex as any,
+      eclaw as any,
+      stateStore as any,
+    );
+    const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
+
+    expect(reply).toBe("Model repaired.");
+    expect(state.reasoningEffort).toBeUndefined();
+    expect(stateStore.write).toHaveBeenCalledWith({
+      model: undefined,
+      reasoningEffort: undefined,
+      threadId: undefined,
+      activeTurnId: undefined,
+    });
+    expect(codex.efforts).toEqual(["medium"]);
   });
 });

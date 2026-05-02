@@ -19,3 +19,18 @@ export function sanitizeCodexModel(model: string | null | undefined): string | u
   if (UNSAFE_MODEL_MARKERS.some((marker) => marker.test(trimmed))) return undefined;
   return trimmed;
 }
+
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
+const REASONING_EFFORT_ALIASES = new Map([
+  ["低", "low"],
+  ["中", "medium"],
+  ["高", "high"],
+  ["超高", "xhigh"],
+]);
+
+export function sanitizeCodexReasoningEffort(effort: string | null | undefined): string | undefined {
+  const trimmed = effort?.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  const normalized = REASONING_EFFORT_ALIASES.get(trimmed) ?? trimmed;
+  return REASONING_EFFORTS.has(normalized) ? normalized : undefined;
+}
