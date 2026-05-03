@@ -151,6 +151,22 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("suppresses operational busy errors instead of sending them to chat", async () => {
+    const d = deps();
+    d.sessionManager.handleInbound = vi
+      .fn()
+      .mockRejectedValue(new Error("Codex is still processing the previous message. Use /interrupt if you want to stop it."));
+    const app = createApp(d);
+
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({ deviceId: "dev", entityId: 1, text: "hello while busy" })
+      .expect(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("responds to /status without invoking Codex turn", async () => {
     const d = deps();
     const app = createApp(d);

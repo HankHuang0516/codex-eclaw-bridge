@@ -440,8 +440,9 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
       await deps.eclaw.sendMessage(await deps.stateStore.read(), reply);
     }
   } catch (err: any) {
-    if (a2aInbound && isOperationalBridgeError(err)) {
-      console.warn(`[bridge] suppressed operational bridge error for A2A inbound: ${sanitizeHealthError(err)}`);
+    if (isOperationalBridgeError(err)) {
+      const source = a2aInbound ? "A2A inbound" : "inbound";
+      console.warn(`[bridge] suppressed operational bridge error for ${source}: ${sanitizeHealthError(err)}`);
       return;
     }
     await deps.eclaw.sendMessage(await deps.stateStore.read(), formatBridgeError(err), { suppressA2A: true });
