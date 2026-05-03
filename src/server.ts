@@ -5,6 +5,7 @@ import { CodexClient } from "./codex-client.js";
 import { EClawClient } from "./eclaw-client.js";
 import { ApprovalRouter } from "./approval-router.js";
 import { sanitizeCodexModel, sanitizeCodexReasoningEffort } from "./model.js";
+import { shouldEmitOutboundReply } from "./noop.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
 import { redactSensitiveText } from "./redact.js";
 import { SessionManager } from "./session-manager.js";
@@ -435,7 +436,7 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
 
   try {
     const reply = await deps.sessionManager.handleInbound(payload);
-    if (reply.trim()) {
+    if (shouldEmitOutboundReply(reply, payload)) {
       await deps.eclaw.sendMessage(await deps.stateStore.read(), reply);
     }
   } catch (err: any) {

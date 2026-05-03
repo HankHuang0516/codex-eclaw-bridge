@@ -1,6 +1,7 @@
 import type { CodexClient } from "./codex-client.js";
 import type { EClawClient } from "./eclaw-client.js";
 import { sanitizeCodexModel, sanitizeCodexReasoningEffort } from "./model.js";
+import { isNoopCompletionText } from "./noop.js";
 import { formatInboundForCodex } from "./payload.js";
 import { redactSensitiveText } from "./redact.js";
 import type { StateStore } from "./state-store.js";
@@ -256,7 +257,7 @@ export class SessionManager {
 
     if (message.method === "turn/completed") {
       const turnError = this.extractTurnError(params);
-      const text = this.extractFinalText(params) || this.activeTurn.text.trim() || "Done.";
+      const text = this.extractFinalText(params) || this.activeTurn.text.trim();
       this.lastTurnError = turnError ? sanitizeErrorMessage(turnError) : undefined;
       clearTimeout(this.activeTurn.timer);
       if (turnError) {
@@ -356,6 +357,7 @@ export class SessionManager {
 
   private async sendStopProgressUpdateIfRequired(state: BridgeState, reply: string): Promise<void> {
     if (isCodexErrorText(reply)) return;
+    if (isNoopCompletionText(reply)) return;
     const remotePolicy = await this.eclaw.getPromptPolicy(state, "codex").catch(() => null);
     const compiledPrompt = remotePolicy?.policy?.compiledPrompt ?? "";
     if (!requiresStopProgressTransform(compiledPrompt)) return;

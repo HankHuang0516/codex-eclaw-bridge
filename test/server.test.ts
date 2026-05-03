@@ -104,6 +104,53 @@ describe("server", () => {
     expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "Done.",
+    "[SILENT]",
+    "ACK",
+    "received",
+    "收到。",
+    [
+      "EClaw progress update",
+      "目前進度：本輪任務已完成，正在送出最終回覆。摘要：Done.",
+      "阻塞點：無。",
+      "下一步：等待下一個指令。",
+    ].join("\n"),
+  ])("suppresses no-op outbound replies: %#", async (reply) => {
+    const d = deps();
+    d.sessionManager.handleInbound = vi.fn().mockResolvedValue(reply);
+    const app = createApp(d);
+
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({ deviceId: "dev", entityId: 1, text: "hello" })
+      .expect(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("suppresses A2A POST-VERIFY ACK echoes", async () => {
+    const d = deps();
+    d.sessionManager.handleInbound = vi.fn().mockResolvedValue("ACK POST-2300-VERIFY-1777780167");
+    const app = createApp(d);
+
+    await request(app)
+      .post("/eclaw-webhook")
+      .send({
+        event: "org_forward",
+        from: "entity:2",
+        fromEntityId: 2,
+        deviceId: "dev",
+        entityId: 1,
+        text: "POST-2300-VERIFY-1777780167 @q0ue2k bare publicCode test",
+      })
+      .expect(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(d.eclaw.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("responds to /status without invoking Codex turn", async () => {
     const d = deps();
     const app = createApp(d);

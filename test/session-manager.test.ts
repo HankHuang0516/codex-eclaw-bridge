@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { isNoopCompletionText } from "../src/noop.js";
 import { requiresStopProgressTransform, SessionManager } from "../src/session-manager.js";
 import type { BridgeConfig, BridgeState, ServerNotificationMessage } from "../src/types.js";
 
@@ -71,6 +72,46 @@ class MockCodexFailedTurn extends EventEmitter {
         } satisfies ServerNotificationMessage);
       });
       return { turn: { id: "turn_failed" } };
+    }
+    return {};
+  }
+}
+
+class MockCodexNoFinalText extends EventEmitter {
+  async request(method: string): Promise<any> {
+    if (method === "thread/start") return { thread: { id: "thread_empty" } };
+    if (method === "turn/start") {
+      queueMicrotask(() => {
+        this.emit("notification", {
+          method: "turn/completed",
+          params: { threadId: "thread_empty", turnId: "turn_empty" },
+        } satisfies ServerNotificationMessage);
+      });
+      return { turn: { id: "turn_empty" } };
+    }
+    return {};
+  }
+}
+
+class MockCodexNoopFinalText extends EventEmitter {
+  async request(method: string): Promise<any> {
+    if (method === "thread/start") return { thread: { id: "thread_noop" } };
+    if (method === "turn/start") {
+      queueMicrotask(() => {
+        this.emit("notification", {
+          method: "item/completed",
+          params: {
+            threadId: "thread_noop",
+            turnId: "turn_noop",
+            item: { type: "agentMessage", phase: "final_answer", text: "Done." },
+          },
+        } satisfies ServerNotificationMessage);
+        this.emit("notification", {
+          method: "turn/completed",
+          params: { threadId: "thread_noop", turnId: "turn_noop" },
+        } satisfies ServerNotificationMessage);
+      });
+      return { turn: { id: "turn_noop" } };
     }
     return {};
   }
@@ -159,6 +200,23 @@ class MockCodexCaptureModel extends EventEmitter {
 }
 
 describe("SessionManager stop-progress enforcement", () => {
+  it.each([
+    "",
+    "Done.",
+    "[SILENT]",
+    "ACK",
+    "received",
+    "收到。",
+    [
+      "EClaw progress update",
+      "目前進度：本輪任務已完成，正在送出最終回覆。摘要：Done.",
+      "阻塞點：無。",
+      "下一步：等待下一個指令。",
+    ].join("\n"),
+  ])("classifies no-op completion text %#", (text) => {
+    expect(isNoopCompletionText(text)).toBe(true);
+  });
+
   it("detects centrally managed stop-progress transform policy", () => {
     expect(requiresStopProgressTransform("在停下手邊工作前，必須先呼叫 EClaw TRANSFORM API 回報目前進度。")).toBe(true);
     expect(requiresStopProgressTransform("Use short replies.")).toBe(false);
@@ -222,6 +280,54 @@ describe("SessionManager stop-progress enforcement", () => {
       expect.stringContaining("本輪任務已完成"),
       expect.anything(),
     );
+  });
+
+  it("returns an empty reply instead of synthesizing Done when Codex has no final text", async () => {
+    const state: BridgeState = { deviceId: "dev", entityId: 6, botSecret: "secret" };
+    const stateStore = {
+      read: vi.fn().mockResolvedValue(state),
+      write: vi.fn().mockResolvedValue(undefined),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue({
+        success: true,
+        policy: {
+          compiledPrompt: "在停下手邊工作前，必須先呼叫 EClaw TRANSFORM API 回報目前進度、阻塞點與下一步。",
+        },
+      }),
+    };
+
+    const manager = new SessionManager(config, new MockCodexNoFinalText() as any, eclaw as any, stateStore as any);
+    const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
+
+    expect(reply).toBe("");
+    expect(eclaw.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not send stop-progress updates for no-op final text", async () => {
+    const state: BridgeState = { deviceId: "dev", entityId: 6, botSecret: "secret" };
+    const stateStore = {
+      read: vi.fn().mockResolvedValue(state),
+      write: vi.fn().mockResolvedValue(undefined),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue({
+        success: true,
+        policy: {
+          compiledPrompt: "在停下手邊工作前，必須先呼叫 EClaw TRANSFORM API 回報目前進度、阻塞點與下一步。",
+        },
+      }),
+    };
+
+    const manager = new SessionManager(config, new MockCodexNoopFinalText() as any, eclaw as any, stateStore as any);
+    const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
+
+    expect(reply).toBe("Done.");
+    expect(eclaw.sendMessage).not.toHaveBeenCalled();
   });
 
   it("self-repairs a recoverable invalid_request turn error and retries once", async () => {
