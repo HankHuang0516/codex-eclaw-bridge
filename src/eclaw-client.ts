@@ -40,10 +40,27 @@ export class EClawClient {
     message: string,
     options: { card?: EClawCard; busy?: boolean; senderHint?: SenderHint } = {},
   ): Promise<ChannelMessageResponse> {
-    if (!state.deviceId || state.entityId === undefined || !state.botSecret) {
+    if (!state.deviceId || state.entityId === undefined) {
       throw new Error("EClaw entity is not bound yet.");
     }
 
+    // Phase 2: channel key path via /api/transform (ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY=true)
+    if (this.config.eclawPreferTransformViaChannelKey && this.config.eclawApiKey) {
+      const body = {
+        deviceId: state.deviceId,
+        entityId: state.entityId,
+        actAs: "channel" as const,
+        state: options.busy ? "BUSY" : "IDLE",
+        message,
+        ...(options.senderHint && { senderHint: options.senderHint }),
+      };
+      return this.postWithChannelKey<ChannelMessageResponse>("/api/transform", body);
+    }
+
+    // Default path: /api/channel/message (Phase 4 fallback)
+    if (!state.botSecret) {
+      throw new Error("EClaw entity is not bound yet.");
+    }
     const body = {
       channel_api_key: this.config.eclawApiKey,
       deviceId: state.deviceId,
@@ -104,6 +121,23 @@ export class EClawClient {
 
   private async post<T>(pathname: string, body: unknown): Promise<T> {
     return this.request<T>(pathname, { method: "POST", body });
+  }
+
+  /** Phase 2: POST to pathname with X-Channel-Key header (no botSecret). */
+  private async postWithChannelKey<T>(pathname: string, body: unknown): Promise<T> {
+    const res = await fetch(`${this.config.eclawApiBase}${pathname}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Channel-Key": this.config.eclawApiKey,
+      },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({}))) as T & { success?: boolean; message?: string };
+    if (!res.ok || data.success === false) {
+      throw new Error(data.message || `EClaw API POST ${pathname} failed with HTTP ${res.status}`);
+    }
+    return data;
   }
 
   private async request<T = unknown>(pathname: string, options: { method: string; body?: unknown }): Promise<T> {
