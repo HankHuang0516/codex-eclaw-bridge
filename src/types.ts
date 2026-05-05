@@ -6,6 +6,8 @@ export type BridgeConfig = {
   eclawWebhookPort: number;
   eclawBotName: string;
   eclawEntityId?: number;
+  /** Phase 2: when true, sendMessage routes to /api/transform + X-Channel-Key. Default false. */
+  eclawPreferTransformViaChannelKey?: boolean;
   eclawCallbackToken?: string;
   eclawCallbackUsername?: string;
   eclawCallbackPassword?: string;

@@ -92,6 +92,74 @@ describe("EClawClient", () => {
     expect(await client.getRoutingPolicy()).toBe("");
   });
 
+  // ── Phase 2: channel key path ─────────────────────────────────────────────
+
+  it("routes to /api/transform with X-Channel-Key when eclawPreferTransformViaChannelKey=true", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const channelKeyConfig: BridgeConfig = { ...config, eclawPreferTransformViaChannelKey: true };
+    const client = new EClawClient(channelKeyConfig);
+    await client.sendMessage({ deviceId: "dev", entityId: 2, botSecret: "secret" }, "hello via channel key");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://eclawbot.com/api/transform",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-Channel-Key": "eck_test" }),
+      }),
+    );
+    const sentBody = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(sentBody.actAs).toBe("channel");
+    expect(sentBody.deviceId).toBe("dev");
+    expect(sentBody.entityId).toBe(2);
+    expect(sentBody.botSecret).toBeUndefined();
+    expect(sentBody.channel_api_key).toBeUndefined();
+  });
+
+  it("falls back to /api/channel/message when eclawPreferTransformViaChannelKey=false (default)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EClawClient(config); // flag defaults to false/undefined
+    await client.sendMessage({ deviceId: "dev", entityId: 2, botSecret: "secret" }, "hello legacy");
+
+    expect(fetchMock).toHaveBeenCalledWith("https://eclawbot.com/api/channel/message", expect.anything());
+    const sentBody = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(sentBody.botSecret).toBe("secret");
+    expect(sentBody.actAs).toBeUndefined();
+  });
+
+  it("throws when botSecret is missing on legacy path", async () => {
+    const client = new EClawClient(config);
+    await expect(
+      client.sendMessage({ deviceId: "dev", entityId: 2 }, "no secret"),
+    ).rejects.toThrow("not bound");
+  });
+
+  it("throws when botSecret is missing but channel key path does not need it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const channelKeyConfig: BridgeConfig = { ...config, eclawPreferTransformViaChannelKey: true };
+    const client = new EClawClient(channelKeyConfig);
+    // Should succeed without botSecret on channel key path
+    await expect(
+      client.sendMessage({ deviceId: "dev", entityId: 2 }, "no botSecret needed"),
+    ).resolves.not.toThrow();
+  });
+
+  // ── fetches centrally managed prompt policy ───────────────────────────────
+
   it("fetches centrally managed prompt policy for the bound entity", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
