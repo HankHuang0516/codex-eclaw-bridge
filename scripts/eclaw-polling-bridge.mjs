@@ -13,6 +13,8 @@ const useCodex = process.env.CODEX_POLL_BRIDGE_USE_CODEX === "1";
 const codexBin = process.env.CODEX_BIN || "codex";
 const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
 const codexReasoningEffort = process.env.CODEX_REASONING_EFFORT || "xhigh";
+const codexReportModel = process.env.CODEX_REPORT_MODEL || "GPT-5.5";
+const codexReportReasoning = process.env.CODEX_REPORT_REASONING || "extrahigh";
 const codexSandbox = process.env.CODEX_POLL_BRIDGE_SANDBOX || "workspace-write";
 const codexBypassApprovals = process.env.CODEX_POLL_BRIDGE_BYPASS_APPROVALS === "1";
 
@@ -129,6 +131,7 @@ function blockedReplyFor(text, error) {
 async function runCodex(text, source) {
   const prompt = [
     "You are Codex entity #6 in EClaw.",
+    `Runtime model policy: model=${codexReportModel}; reasoning=${codexReportReasoning}. Internal Codex config is CODEX_MODEL=${codexModel} and CODEX_REASONING_EFFORT=${codexReasoningEffort}. If asked to report your current model/reasoning, use model=${codexReportModel} reasoning=${codexReportReasoning} exactly.`,
     "Complete the inbound EClaw request, then reply concisely with what you did or why you are blocked.",
     "If the request asks for Computer Use, browser operation, desktop operation, or visible UI verification, actually use the available Computer Use tools before replying.",
     "Do not satisfy Computer Use requests with shell commands, open, osascript, AppleScript, or API calls; use the Computer Use MCP tools directly.",
