@@ -106,6 +106,8 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `CODEX_SANDBOX` |  | `workspace-write` | Codex sandbox |
 | `CODEX_APPROVAL_POLICY` |  | `on-request` | Codex approval policy |
 | `CODEX_APP_SERVER_LISTEN` |  | `ws://127.0.0.1:0` | App-server listen URL |
+| `CODEX_POLL_BRIDGE_BYPASS_APPROVALS` |  | `false` | Polling bridge only: pass `--dangerously-bypass-approvals-and-sandbox` to non-interactive `codex exec`, needed for unattended Computer Use app access |
+| `CODEX_POLL_BRIDGE_TIMEOUT_MS` |  | `240000` | Polling bridge only: maximum `codex exec` turn duration before replying with a blocked/error message |
 | `BRIDGE_STATE_PATH` |  | `.data/state.json` | Runtime state path |
 | `BRIDGE_REPLY_TIMEOUT_MS` |  | `600000` | Turn reply timeout |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` |  | `900000` | Approval card timeout |
@@ -217,6 +219,21 @@ CODEX_APPROVAL_POLICY=on-request
 ```
 
 Keep `on-request` so command/file approvals still become EClaw rich cards.
+
+### Polling Bridge Computer Use
+
+The fallback polling bridge runs `codex exec` non-interactively. Computer Use
+app access is requested through MCP elicitation; without
+`CODEX_POLL_BRIDGE_BYPASS_APPROVALS=1`, those app-access requests are denied and
+the bot must report that Computer Use is blocked. For browser automation, use a
+real browser app such as Google Chrome or Safari. Computer Use intentionally
+blocks the Codex desktop app / in-app browser (`com.openai.codex`).
+
+For #6 on Hank's local fleet, run the polling bridge from the dedicated
+`codex-eclaw-cua` tmux socket rather than the legacy default tmux server. The
+old server can inherit a macOS Automation/TCC context that makes Chrome access
+fail with Apple event `-1743`; the dedicated socket preserves the desktop
+Computer Use context used by the working #6 browser-chat validation.
 
 ## Security Notes
 
