@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 const apiBase = process.env.ECLAW_API_BASE || "https://eclawbot.com";
 const root = path.resolve(process.env.CODEX_ECLAW_BRIDGE_DIR || process.cwd());
+const positiveNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
 const statePath = path.resolve(process.env.BRIDGE_STATE_PATH || path.join(root, ".data/state.json"));
 const workspace = process.env.CODEX_WORKSPACE || "/Users/hank/Desktop/Project";
 const pollMs = Number(process.env.ECLAW_POLL_MS || 4000);
@@ -17,6 +22,11 @@ const codexReportModel = process.env.CODEX_REPORT_MODEL || "GPT-5.5";
 const codexReportReasoning = process.env.CODEX_REPORT_REASONING || "extrahigh";
 const codexSandbox = process.env.CODEX_POLL_BRIDGE_SANDBOX || "workspace-write";
 const codexBypassApprovals = process.env.CODEX_POLL_BRIDGE_BYPASS_APPROVALS === "1";
+const codexTimeoutMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TIMEOUT_MS, 600000);
+const codexTerminateGraceMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS, 10000);
+const codexDiagnosticLog = path.resolve(
+  process.env.CODEX_POLL_BRIDGE_DIAGNOSTIC_LOG || path.join(root, ".data/codex-exec-diagnostics.jsonl"),
+);
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
@@ -117,6 +127,39 @@ function compactError(error) {
     .slice(0, 320);
 }
 
+function redactDiagnosticText(value) {
+  return String(value || "")
+    .replace(/(bearer\s+)[^\s"']+/ig, "$1[REDACTED]")
+    .replace(
+      /((?:["']?(?:api[_-]?key|botSecret|deviceSecret|password|secret|token)["']?\s*[:=]\s*["']?))[^\s"',}]+/ig,
+      "$1[REDACTED]",
+    );
+}
+
+function tailDiagnosticText(value, limit = 8000) {
+  return redactDiagnosticText(String(value || "").replace(/\r/g, "").slice(-limit));
+}
+
+function readOutputTail(outputPath) {
+  try {
+    return tailDiagnosticText(fsSync.readFileSync(outputPath, "utf8"));
+  } catch {
+    return "";
+  }
+}
+
+function writeCodexDiagnostic(event) {
+  try {
+    fsSync.mkdirSync(path.dirname(codexDiagnosticLog), { recursive: true });
+    fsSync.appendFileSync(
+      codexDiagnosticLog,
+      JSON.stringify({ at: new Date().toISOString(), ...event }) + "\n",
+    );
+  } catch (error) {
+    log("codex diagnostic write failed", { error: compactError(error) });
+  }
+}
+
 function blockedReplyFor(text, error) {
   const reason = compactError(error);
   const explicit = /\b([A-Z0-9_]+_BLOCKED\s+[A-Z0-9_]+(?:_[A-Z0-9]+)*)\b/.exec(text);
@@ -128,7 +171,7 @@ function blockedReplyFor(text, error) {
   return `#6_BLOCKED reason=${reason}`;
 }
 
-async function runCodex(text, source) {
+async function runCodex(text, source, inboundId) {
   const prompt = [
     "You are Codex entity #6 in EClaw.",
     `Runtime model policy: model=${codexReportModel}; reasoning=${codexReportReasoning}. Internal Codex config is CODEX_MODEL=${codexModel} and CODEX_REASONING_EFFORT=${codexReasoningEffort}. If asked to report your current model/reasoning, use model=${codexReportModel} reasoning=${codexReportReasoning} exactly.`,
@@ -153,6 +196,7 @@ async function runCodex(text, source) {
   };
 
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const args = [
       "exec",
       "--ephemeral",
@@ -174,6 +218,20 @@ async function runCodex(text, source) {
     if (codexBypassApprovals) {
       args.splice(1, 0, "--dangerously-bypass-approvals-and-sandbox");
     }
+    const diagnosticContext = {
+      inboundId: inboundId || null,
+      source: String(source || "unknown").slice(0, 160),
+      command: [codexBin, ...args].join(" "),
+      workspace,
+      codexModel,
+      codexReasoningEffort,
+      codexSandbox,
+      codexBypassApprovals,
+      timeoutMs: codexTimeoutMs,
+      terminateGraceMs: codexTerminateGraceMs,
+      textPreview: tailDiagnosticText(text, 500),
+    };
+    writeCodexDiagnostic({ event: "start", ...diagnosticContext });
 
     const child = spawn(codexBin, args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -181,28 +239,77 @@ async function runCodex(text, source) {
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    let sigkillTimer = null;
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      cleanup();
-      reject(new Error("codex exec timed out"));
-    }, Number(process.env.CODEX_POLL_BRIDGE_TIMEOUT_MS || 600000));
+      timedOut = true;
+      writeCodexDiagnostic({
+        event: "timeout_before_sigterm",
+        ...diagnosticContext,
+        durationMs: Date.now() - startedAt,
+        stdoutTail: tailDiagnosticText(stdout),
+        stderrTail: tailDiagnosticText(stderr),
+        outputTail: readOutputTail(outputPath),
+      });
+      const killed = child.kill("SIGTERM");
+      writeCodexDiagnostic({
+        event: "timeout_sigterm_sent",
+        ...diagnosticContext,
+        durationMs: Date.now() - startedAt,
+        killed,
+      });
+      sigkillTimer = setTimeout(() => {
+        const killedBySigkill = child.kill("SIGKILL");
+        writeCodexDiagnostic({
+          event: "timeout_sigkill_sent",
+          ...diagnosticContext,
+          durationMs: Date.now() - startedAt,
+          killed: killedBySigkill,
+        });
+      }, codexTerminateGraceMs);
+    }, codexTimeoutMs);
 
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     child.on("error", (error) => {
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      writeCodexDiagnostic({
+        event: "spawn_error",
+        ...diagnosticContext,
+        durationMs: Date.now() - startedAt,
+        error: compactError(error),
+        stdoutTail: tailDiagnosticText(stdout),
+        stderrTail: tailDiagnosticText(stderr),
+        outputTail: readOutputTail(outputPath),
+      });
       cleanup();
       reject(error);
     });
-    child.on("close", async (code) => {
+    child.on("close", async (code, signal) => {
       clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      const lastMessage = await fs.readFile(outputPath, "utf8").catch(() => "");
+      const outputTail = tailDiagnosticText(lastMessage);
+      writeCodexDiagnostic({
+        event: timedOut ? "close_after_timeout" : "close",
+        ...diagnosticContext,
+        durationMs: Date.now() - startedAt,
+        code,
+        signal,
+        stdoutTail: tailDiagnosticText(stdout),
+        stderrTail: tailDiagnosticText(stderr),
+        outputTail,
+      });
+      await cleanup();
+      if (timedOut) {
+        reject(new Error(`codex exec timed out after ${codexTimeoutMs}ms`));
+        return;
+      }
       if (code !== 0) {
-        await cleanup();
         reject(new Error(`codex exec exited ${code}: ${stderr.slice(-500)}`));
         return;
       }
-      const lastMessage = await fs.readFile(outputPath, "utf8").catch(() => "");
-      await cleanup();
       resolve(lastMessage.trim() || stdout.trim() || "Codex completed with no text output.");
     });
     child.stdin.end(prompt);
@@ -257,7 +364,7 @@ async function pollOnce(state) {
     let reply = replyFor(text);
     if (reply === null) {
       try {
-        reply = await runCodex(text, source);
+        reply = await runCodex(text, source, message.id);
       } catch (error) {
         reply = blockedReplyFor(text, error);
       }
@@ -282,6 +389,8 @@ async function main() {
     codexReasoningEffort,
     codexSandbox,
     codexBypassApprovals,
+    codexTimeoutMs,
+    codexDiagnosticLog,
     pollMs,
   });
 
