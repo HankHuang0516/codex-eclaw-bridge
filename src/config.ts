@@ -3,6 +3,15 @@ import path from "node:path";
 import { z } from "zod";
 import type { BridgeConfig } from "./types.js";
 
+const booleanEnv = z.preprocess((value) => {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off", ""].includes(normalized)) return false;
+  }
+  return value;
+}, z.boolean());
+
 const envSchema = z.object({
   ECLAW_API_BASE: z.string().url().default("https://eclawbot.com"),
   ECLAW_API_KEY: z.string().min(1),
@@ -25,10 +34,11 @@ const envSchema = z.object({
   BRIDGE_REPLY_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
   BRIDGE_APPROVAL_TIMEOUT_MS: z.coerce.number().int().positive().default(900_000),
   BRIDGE_SEND_BUSY_UPDATES: z.coerce.boolean().default(false),
+  BRIDGE_STOP_PROGRESS_UPDATES: booleanEnv.default(false),
   BRIDGE_REQUIRE_CALLBACK_AUTH: z.coerce.boolean().default(false),
   BRIDGE_STATUS_HEARTBEAT_ENABLED: z.coerce.boolean().default(true),
   BRIDGE_STATUS_HEARTBEAT_MS: z.coerce.number().int().positive().default(180_000),
-  ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY: z.coerce.boolean().default(false),
+  ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY: booleanEnv.default(false),
 });
 
 function emptyToUndefined(value: string | undefined): string | undefined {
@@ -63,6 +73,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     bridgeReplyTimeoutMs: parsed.BRIDGE_REPLY_TIMEOUT_MS,
     bridgeApprovalTimeoutMs: parsed.BRIDGE_APPROVAL_TIMEOUT_MS,
     bridgeSendBusyUpdates: parsed.BRIDGE_SEND_BUSY_UPDATES,
+    bridgeStopProgressUpdates: parsed.BRIDGE_STOP_PROGRESS_UPDATES,
     bridgeRequireCallbackAuth: parsed.BRIDGE_REQUIRE_CALLBACK_AUTH,
     bridgeStatusHeartbeatEnabled: parsed.BRIDGE_STATUS_HEARTBEAT_ENABLED,
     bridgeStatusHeartbeatMs: parsed.BRIDGE_STATUS_HEARTBEAT_MS,

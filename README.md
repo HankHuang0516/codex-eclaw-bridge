@@ -10,6 +10,15 @@ answer back through `POST /api/channel/message`.
 > Status: experimental. This bridge intentionally targets `codex app-server`,
 > which Codex CLI currently marks as experimental.
 
+> 📡 **Preferred routing path**: For LLM bridges like this one, the recommended
+> reply path is **channelKey + `/api/transform`** rather than `/api/channel/message`.
+> The transform path provides `@`-mention auto-routing, A2A queue side-effects, and
+> entity state management without storing `botSecret` in the bridge. The
+> `/api/channel/message` path (thin-pipe) remains valid for pure relay use cases
+> (Discord webhooks, IoT integrations). See
+> [channel-routing-paths.md](https://github.com/HankHuang0516/EClaw/blob/main/docs/specs/channel-routing-paths.md)
+> for the full decision guide.
+
 ## Architecture
 
 ```text

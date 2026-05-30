@@ -18,6 +18,7 @@ const config: BridgeConfig = {
   bridgeReplyTimeoutMs: 1000,
   bridgeApprovalTimeoutMs: 1000,
   bridgeSendBusyUpdates: false,
+  bridgeStopProgressUpdates: false,
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,
@@ -107,7 +108,7 @@ describe("SessionManager stop-progress enforcement", () => {
     expect(requiresStopProgressTransform("Use short replies.")).toBe(false);
   });
 
-  it("sends a progress transform before returning the final reply when policy requires it", async () => {
+  it("does not send a stop-progress transform by default", async () => {
     const state: BridgeState = { deviceId: "dev", entityId: 6, botSecret: "secret" };
     const stateStore = {
       read: vi.fn().mockResolvedValue(state),
@@ -126,6 +127,36 @@ describe("SessionManager stop-progress enforcement", () => {
     };
 
     const manager = new SessionManager(config, new MockCodex() as any, eclaw as any, stateStore as any);
+    const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
+
+    expect(reply).toBe("Final answer.");
+    expect(eclaw.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("sends a progress transform when explicitly enabled and policy requires it", async () => {
+    const state: BridgeState = { deviceId: "dev", entityId: 6, botSecret: "secret" };
+    const stateStore = {
+      read: vi.fn().mockResolvedValue(state),
+      write: vi.fn().mockResolvedValue(undefined),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue({
+        success: true,
+        policy: {
+          compiledPrompt: "在停下手邊工作前，必須先呼叫 EClaw TRANSFORM API 回報目前進度、阻塞點與下一步。",
+        },
+      }),
+      getRoutingPolicy: vi.fn().mockResolvedValue(""),
+    };
+
+    const manager = new SessionManager(
+      { ...config, bridgeStopProgressUpdates: true },
+      new MockCodex() as any,
+      eclaw as any,
+      stateStore as any,
+    );
     const reply = await manager.handleInbound({ deviceId: "dev", entityId: 6, text: "hello" });
 
     expect(reply).toBe("Final answer.");

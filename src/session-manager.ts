@@ -336,6 +336,7 @@ export class SessionManager {
   }
 
   private async sendStopProgressUpdateIfRequired(state: BridgeState, reply: string): Promise<void> {
+    if (!this.config.bridgeStopProgressUpdates) return;
     const remotePolicy = await this.eclaw.getPromptPolicy(state, "codex").catch(() => null);
     const compiledPrompt = remotePolicy?.policy?.compiledPrompt ?? "";
     if (!requiresStopProgressTransform(compiledPrompt)) return;

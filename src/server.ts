@@ -28,6 +28,17 @@ export type BridgeAppDeps = {
 
 export function createApp(deps: BridgeAppDeps): express.Express {
   const app = express();
+  const webhookBasePath = getWebhookBasePath(deps.config.eclawWebhookUrl);
+  if (webhookBasePath) {
+    app.use((req, _res, next) => {
+      if (req.url === webhookBasePath) {
+        req.url = "/";
+      } else if (req.url.startsWith(`${webhookBasePath}/`)) {
+        req.url = req.url.slice(webhookBasePath.length);
+      }
+      next();
+    });
+  }
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/health", async (_req, res) => {
@@ -113,6 +124,15 @@ export function createApp(deps: BridgeAppDeps): express.Express {
   });
 
   return app;
+}
+
+function getWebhookBasePath(webhookUrl: string): string {
+  try {
+    const pathname = new URL(webhookUrl).pathname.replace(/\/+$/, "");
+    return pathname === "/" ? "" : pathname;
+  } catch {
+    return "";
+  }
 }
 
 export async function bootstrap(): Promise<void> {
