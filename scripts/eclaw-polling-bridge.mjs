@@ -11,6 +11,13 @@ const positiveNumber = (value, fallback) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
+const booleanFlag = (value, fallback) => {
+  if (value === undefined || value === null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+};
 const statePath = path.resolve(process.env.BRIDGE_STATE_PATH || path.join(root, ".data/state.json"));
 const workspace = process.env.CODEX_WORKSPACE || "/Users/hank/Desktop/Project";
 const pollMs = Number(process.env.ECLAW_POLL_MS || 4000);
@@ -22,11 +29,14 @@ const codexReportModel = process.env.CODEX_REPORT_MODEL || "GPT-5.5";
 const codexReportReasoning = process.env.CODEX_REPORT_REASONING || "extrahigh";
 const codexSandbox = process.env.CODEX_POLL_BRIDGE_SANDBOX || "workspace-write";
 const codexBypassApprovals = process.env.CODEX_POLL_BRIDGE_BYPASS_APPROVALS === "1";
-const codexTimeoutMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TIMEOUT_MS, 600000);
+const codexTimeoutMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TIMEOUT_MS, 1200000);
 const codexTerminateGraceMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS, 10000);
 const codexDiagnosticLog = path.resolve(
   process.env.CODEX_POLL_BRIDGE_DIAGNOSTIC_LOG || path.join(root, ".data/codex-exec-diagnostics.jsonl"),
 );
+const codexStatusUpdatesEnabled = booleanFlag(process.env.CODEX_POLL_BRIDGE_STATUS_UPDATES, true);
+const codexStatusInitialMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_INITIAL_MS, 30000);
+const codexStatusMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_MS, 180000);
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
@@ -140,6 +150,19 @@ function tailDiagnosticText(value, limit = 8000) {
   return redactDiagnosticText(String(value || "").replace(/\r/g, "").slice(-limit));
 }
 
+function summarizeText(value, limit = 120) {
+  const text = String(value || "").trim().replace(/\s+/g, " ");
+  return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
+}
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+
 function readOutputTail(outputPath) {
   try {
     return tailDiagnosticText(fsSync.readFileSync(outputPath, "utf8"));
@@ -171,7 +194,10 @@ function blockedReplyFor(text, error) {
   return `#6_BLOCKED reason=${reason}`;
 }
 
-async function runCodex(text, source, inboundId) {
+async function runCodex(state, inbound) {
+  const text = String(inbound.text || "");
+  const source = String(inbound.source || "");
+  const inboundId = inbound.id || null;
   const prompt = [
     "You are Codex entity #6 in EClaw.",
     `Runtime model policy: model=${codexReportModel}; reasoning=${codexReportReasoning}. Internal Codex config is CODEX_MODEL=${codexModel} and CODEX_REASONING_EFFORT=${codexReasoningEffort}. If asked to report your current model/reasoning, use model=${codexReportModel} reasoning=${codexReportReasoning} exactly.`,
@@ -241,6 +267,37 @@ async function runCodex(text, source, inboundId) {
     let stderr = "";
     let timedOut = false;
     let sigkillTimer = null;
+    let statusTimer = null;
+    let statusInFlight = false;
+    let codexRunning = true;
+    let lastOutputAt = null;
+    const clearStatusTimer = () => {
+      if (statusTimer) clearTimeout(statusTimer);
+      statusTimer = null;
+    };
+    const scheduleStatusUpdate = (delayMs) => {
+      if (!codexStatusUpdatesEnabled) return;
+      statusTimer = setTimeout(() => {
+        if (!codexRunning) return;
+        emitStatusUpdate();
+        if (codexRunning) scheduleStatusUpdate(codexStatusMs);
+      }, delayMs);
+      statusTimer.unref?.();
+    };
+    const emitStatusUpdate = () => {
+      if (!codexRunning) return;
+      if (statusInFlight) return;
+      statusInFlight = true;
+      sendCodexStatusUpdate(state, inbound, {
+        durationMs: Date.now() - startedAt,
+        prompt: text,
+        lastOutputAt,
+      })
+        .catch((error) => log("codex status update failed", { inboundId, error: compactError(error) }))
+        .finally(() => {
+          statusInFlight = false;
+        });
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       writeCodexDiagnostic({
@@ -269,11 +326,21 @@ async function runCodex(text, source, inboundId) {
       }, codexTerminateGraceMs);
     }, codexTimeoutMs);
 
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    scheduleStatusUpdate(codexStatusInitialMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      lastOutputAt = new Date().toISOString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      lastOutputAt = new Date().toISOString();
+    });
     child.on("error", (error) => {
+      codexRunning = false;
       clearTimeout(timer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
+      clearStatusTimer();
       writeCodexDiagnostic({
         event: "spawn_error",
         ...diagnosticContext,
@@ -287,8 +354,10 @@ async function runCodex(text, source, inboundId) {
       reject(error);
     });
     child.on("close", async (code, signal) => {
+      codexRunning = false;
       clearTimeout(timer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
+      clearStatusTimer();
       const lastMessage = await fs.readFile(outputPath, "utf8").catch(() => "");
       const outputTail = tailDiagnosticText(lastMessage);
       writeCodexDiagnostic({
@@ -316,18 +385,42 @@ async function runCodex(text, source, inboundId) {
   });
 }
 
-async function sendReply(state, inbound, reply) {
+function transformRoutingForInbound(inbound) {
   const fromId = senderEntityId(inbound.source);
   const speakTo = fromId != null ? entityCodeById.get(fromId) : null;
+  return speakTo ? { speakTo: [speakTo] } : {};
+}
+
+async function sendTransformMessage(state, inbound, message, busy = false) {
   const body = {
     deviceId: state.deviceId,
     entityId: state.entityId,
     botSecret: state.botSecret,
-    state: "IDLE",
-    message: reply,
-    ...(speakTo ? { speakTo: [speakTo] } : {}),
+    state: busy ? "BUSY" : "IDLE",
+    message,
+    ...transformRoutingForInbound(inbound),
   };
   await apiPost("/api/transform", body);
+}
+
+async function sendCodexStatusUpdate(state, inbound, status) {
+  await sendTransformMessage(
+    state,
+    inbound,
+    [
+      "Codex #6 status heartbeat",
+      `- Task: ${summarizeText(status.prompt) || "(unknown task)"}`,
+      `- Elapsed: ${formatElapsed(status.durationMs)}`,
+      `- Timeout limit: ${formatElapsed(codexTimeoutMs)}`,
+      `- Last exec output: ${status.lastOutputAt || "(none yet)"}`,
+      "- State: codex exec is still running; final reply will be sent when it completes.",
+    ].join("\n"),
+    true,
+  );
+}
+
+async function sendReply(state, inbound, reply) {
+  await sendTransformMessage(state, inbound, reply, false);
 }
 
 async function pollOnce(state) {
@@ -364,7 +457,7 @@ async function pollOnce(state) {
     let reply = replyFor(text);
     if (reply === null) {
       try {
-        reply = await runCodex(text, source, message.id);
+        reply = await runCodex(state, message);
       } catch (error) {
         reply = blockedReplyFor(text, error);
       }
@@ -390,6 +483,9 @@ async function main() {
     codexSandbox,
     codexBypassApprovals,
     codexTimeoutMs,
+    codexStatusUpdatesEnabled,
+    codexStatusInitialMs,
+    codexStatusMs,
     codexDiagnosticLog,
     pollMs,
   });
@@ -399,7 +495,11 @@ async function main() {
       await pollOnce(state);
     } catch (error) {
       log("poll error", { error: error.message });
-      try { await refreshEntities(state); } catch {}
+      try {
+        await refreshEntities(state);
+      } catch {
+        // The next polling cycle will retry with the current routing cache.
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }

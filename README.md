@@ -116,9 +116,12 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `CODEX_APPROVAL_POLICY` |  | `on-request` | Codex approval policy |
 | `CODEX_APP_SERVER_LISTEN` |  | `ws://127.0.0.1:0` | App-server listen URL |
 | `CODEX_POLL_BRIDGE_BYPASS_APPROVALS` |  | `false` | Polling bridge only: pass `--dangerously-bypass-approvals-and-sandbox` to non-interactive `codex exec`, needed for unattended Computer Use app access |
-| `CODEX_POLL_BRIDGE_TIMEOUT_MS` |  | `600000` | Polling bridge only: maximum `codex exec` turn duration before replying with a blocked/error message |
+| `CODEX_POLL_BRIDGE_TIMEOUT_MS` |  | `1200000` | Polling bridge only: maximum `codex exec` turn duration before replying with a blocked/error message |
 | `CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS` |  | `10000` | Polling bridge only: grace period after timeout SIGTERM before SIGKILL |
 | `CODEX_POLL_BRIDGE_DIAGNOSTIC_LOG` |  | `.data/codex-exec-diagnostics.jsonl` | Polling bridge only: JSONL diagnostics for `codex exec` start, timeout, close, signal, stdout/stderr tails, and output tail |
+| `CODEX_POLL_BRIDGE_STATUS_UPDATES` |  | `true` | Polling bridge only: send visible BUSY status heartbeats while `codex exec` is still running (`false`/`0` disables) |
+| `CODEX_POLL_BRIDGE_STATUS_INITIAL_MS` |  | `30000` | Polling bridge only: first status heartbeat delay after spawning `codex exec` |
+| `CODEX_POLL_BRIDGE_STATUS_MS` |  | `180000` | Polling bridge only: recurring status heartbeat interval while `codex exec` runs |
 | `BRIDGE_STATE_PATH` |  | `.data/state.json` | Runtime state path |
 | `BRIDGE_REPLY_TIMEOUT_MS` |  | `600000` | Turn reply timeout |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` |  | `900000` | Approval card timeout |
@@ -129,12 +132,14 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 
 Never commit `.env`. `.gitignore` excludes `.env*` except `.env.example`.
 
-For the #6 polling bridge, keep `CODEX_POLL_BRIDGE_TIMEOUT_MS=600000` when
-running `gpt-5.5` with `CODEX_REASONING_EFFORT=xhigh`; 240s is too short for
-large-workspace cold starts and roadmap tasks. Timeout diagnostics are appended
-to `.data/codex-exec-diagnostics.jsonl` with redacted stdout/stderr/output
-tails, exit code/signal, and the SIGTERM/SIGKILL sequence used to stop a stuck
-`codex exec`.
+For the #6 polling bridge, keep `CODEX_POLL_BRIDGE_TIMEOUT_MS=1200000` when
+running `gpt-5.5` with `CODEX_REASONING_EFFORT=xhigh`; shorter ceilings are too
+tight for large-workspace cold starts and roadmap tasks. While `codex exec` is
+still running, the polling bridge sends BUSY status heartbeats back to the
+request sender after 30 seconds and then every 3 minutes. Timeout diagnostics
+are appended to `.data/codex-exec-diagnostics.jsonl` with redacted
+stdout/stderr/output tails, exit code/signal, and the SIGTERM/SIGKILL sequence
+used to stop a stuck `codex exec`.
 
 ## Bridge Commands
 
