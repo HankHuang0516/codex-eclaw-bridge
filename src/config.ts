@@ -36,7 +36,8 @@ const envSchema = z.object({
   BRIDGE_SEND_BUSY_UPDATES: z.coerce.boolean().default(false),
   BRIDGE_STOP_PROGRESS_UPDATES: booleanEnv.default(false),
   BRIDGE_REQUIRE_CALLBACK_AUTH: z.coerce.boolean().default(false),
-  BRIDGE_STATUS_HEARTBEAT_ENABLED: z.coerce.boolean().default(true),
+  BUSY_HEARTBEAT_DISABLED: booleanEnv.default(false),
+  BRIDGE_STATUS_HEARTBEAT_ENABLED: booleanEnv.default(false),
   BRIDGE_STATUS_HEARTBEAT_MS: z.coerce.number().int().positive().default(180_000),
   ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY: booleanEnv.default(false),
 });
@@ -75,7 +76,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     bridgeSendBusyUpdates: parsed.BRIDGE_SEND_BUSY_UPDATES,
     bridgeStopProgressUpdates: parsed.BRIDGE_STOP_PROGRESS_UPDATES,
     bridgeRequireCallbackAuth: parsed.BRIDGE_REQUIRE_CALLBACK_AUTH,
-    bridgeStatusHeartbeatEnabled: parsed.BRIDGE_STATUS_HEARTBEAT_ENABLED,
+    bridgeStatusHeartbeatEnabled: parsed.BRIDGE_STATUS_HEARTBEAT_ENABLED && !parsed.BUSY_HEARTBEAT_DISABLED,
     bridgeStatusHeartbeatMs: parsed.BRIDGE_STATUS_HEARTBEAT_MS,
     eclawPreferTransformViaChannelKey: parsed.ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY,
   };

@@ -4,12 +4,17 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const apiBase = process.env.ECLAW_API_BASE || "https://eclawbot.com";
 const root = path.resolve(process.env.CODEX_ECLAW_BRIDGE_DIR || process.cwd());
 const positiveNumber = (value, fallback) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+const nonNegativeNumber = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 const booleanFlag = (value, fallback) => {
   if (value === undefined || value === null || value === "") return fallback;
@@ -29,14 +34,28 @@ const codexReportModel = process.env.CODEX_REPORT_MODEL || "GPT-5.5";
 const codexReportReasoning = process.env.CODEX_REPORT_REASONING || "extrahigh";
 const codexSandbox = process.env.CODEX_POLL_BRIDGE_SANDBOX || "workspace-write";
 const codexBypassApprovals = process.env.CODEX_POLL_BRIDGE_BYPASS_APPROVALS === "1";
-const codexTimeoutMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TIMEOUT_MS, 1200000);
-const codexTerminateGraceMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS, 10000);
+const codexTimeoutMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TIMEOUT_MS, 20 * 60_000);
+const codexNearTimeoutWarningMs = nonNegativeNumber(
+  process.env.CODEX_POLL_BRIDGE_NEAR_TIMEOUT_WARNING_MS,
+  15 * 60_000,
+);
+const codexNearTimeoutCancelMs = positiveNumber(
+  process.env.CODEX_POLL_BRIDGE_NEAR_TIMEOUT_CANCEL_MS,
+  18 * 60_000,
+);
+const codexTerminateGraceMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS, 2 * 60_000);
 const codexDiagnosticLog = path.resolve(
   process.env.CODEX_POLL_BRIDGE_DIAGNOSTIC_LOG || path.join(root, ".data/codex-exec-diagnostics.jsonl"),
 );
-const codexStatusUpdatesEnabled = booleanFlag(process.env.CODEX_POLL_BRIDGE_STATUS_UPDATES, true);
+const busyHeartbeatDisabled = booleanFlag(process.env.BUSY_HEARTBEAT_DISABLED, false);
+const codexStatusUpdatesEnabled =
+  !busyHeartbeatDisabled && booleanFlag(process.env.CODEX_POLL_BRIDGE_STATUS_UPDATES, false);
+const codexNearTimeoutWarningEnabled =
+  !busyHeartbeatDisabled && codexNearTimeoutWarningMs > 0 && codexNearTimeoutWarningMs < codexTimeoutMs;
+const codexNearTimeoutCancelEnabled = codexNearTimeoutCancelMs > 0 && codexNearTimeoutCancelMs < codexTimeoutMs;
 const codexStatusInitialMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_INITIAL_MS, 30000);
 const codexStatusMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_MS, 180000);
+const redactedTaskPreview = "[task in progress - preview redacted to prevent secret leak]";
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
@@ -150,11 +169,6 @@ function tailDiagnosticText(value, limit = 8000) {
   return redactDiagnosticText(String(value || "").replace(/\r/g, "").slice(-limit));
 }
 
-function summarizeText(value, limit = 120) {
-  const text = String(value || "").trim().replace(/\s+/g, " ");
-  return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
-}
-
 function formatElapsed(ms) {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -194,7 +208,7 @@ function blockedReplyFor(text, error) {
   return `#6_BLOCKED reason=${reason}`;
 }
 
-async function runCodex(state, inbound) {
+export async function runCodex(state, inbound) {
   const text = String(inbound.text || "");
   const source = String(inbound.source || "");
   const inboundId = inbound.id || null;
@@ -215,7 +229,7 @@ async function runCodex(state, inbound) {
     text,
   ].join("\n");
 
-  const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "eclaw-codex-reply-"));
+  const outputDir = fsSync.mkdtempSync(path.join(os.tmpdir(), "eclaw-codex-reply-"));
   const outputPath = path.join(outputDir, "reply.txt");
   const cleanup = async () => {
     await fs.rm(outputDir, { recursive: true, force: true }).catch(() => {});
@@ -254,6 +268,8 @@ async function runCodex(state, inbound) {
       codexSandbox,
       codexBypassApprovals,
       timeoutMs: codexTimeoutMs,
+      nearTimeoutWarningMs: codexNearTimeoutWarningMs,
+      nearTimeoutCancelMs: codexNearTimeoutCancelMs,
       terminateGraceMs: codexTerminateGraceMs,
       textPreview: tailDiagnosticText(text, 500),
     };
@@ -266,10 +282,16 @@ async function runCodex(state, inbound) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let cancelTimer = null;
     let sigkillTimer = null;
+    let hardTimeoutTimer = null;
     let statusTimer = null;
+    let warningTimer = null;
     let statusInFlight = false;
     let codexRunning = true;
+    let timeoutCancelSent = false;
+    let timeoutKillSent = false;
+    let scheduledSigkillAt = null;
     let lastOutputAt = null;
     const clearStatusTimer = () => {
       if (statusTimer) clearTimeout(statusTimer);
@@ -290,7 +312,6 @@ async function runCodex(state, inbound) {
       statusInFlight = true;
       sendCodexStatusUpdate(state, inbound, {
         durationMs: Date.now() - startedAt,
-        prompt: text,
         lastOutputAt,
       })
         .catch((error) => log("codex status update failed", { inboundId, error: compactError(error) }))
@@ -298,35 +319,79 @@ async function runCodex(state, inbound) {
           statusInFlight = false;
         });
     };
-    const timer = setTimeout(() => {
+    const scheduleTimeoutWarning = () => {
+      if (!codexNearTimeoutWarningEnabled) return;
+      warningTimer = setTimeout(() => {
+        if (!codexRunning) return;
+        writeCodexDiagnostic({
+          event: "timeout_warning",
+          ...diagnosticContext,
+          durationMs: Date.now() - startedAt,
+          stdoutTail: tailDiagnosticText(stdout),
+          stderrTail: tailDiagnosticText(stderr),
+          outputTail: readOutputTail(outputPath),
+        });
+        sendCodexTimeoutWarning(state, inbound, {
+          durationMs: Date.now() - startedAt,
+          lastOutputAt,
+        }).catch((error) => log("codex timeout warning failed", { inboundId, error: compactError(error) }));
+      }, codexNearTimeoutWarningMs);
+      warningTimer.unref?.();
+    };
+    const sendTimeoutKill = (trigger) => {
+      if (!codexRunning || timeoutKillSent) return;
       timedOut = true;
+      timeoutKillSent = true;
+      const killed = child.kill("SIGKILL");
       writeCodexDiagnostic({
-        event: "timeout_before_sigterm",
+        event: "timeout_kill",
         ...diagnosticContext,
         durationMs: Date.now() - startedAt,
+        trigger,
+        killed,
         stdoutTail: tailDiagnosticText(stdout),
         stderrTail: tailDiagnosticText(stderr),
         outputTail: readOutputTail(outputPath),
       });
+    };
+    const sendTimeoutCancel = (trigger) => {
+      if (!codexRunning || timeoutCancelSent) return;
+      timedOut = true;
+      timeoutCancelSent = true;
       const killed = child.kill("SIGTERM");
       writeCodexDiagnostic({
-        event: "timeout_sigterm_sent",
+        event: "timeout_cancel",
         ...diagnosticContext,
         durationMs: Date.now() - startedAt,
+        trigger,
         killed,
+        stdoutTail: tailDiagnosticText(stdout),
+        stderrTail: tailDiagnosticText(stderr),
+        outputTail: readOutputTail(outputPath),
       });
+      scheduledSigkillAt = startedAt + codexNearTimeoutCancelMs + codexTerminateGraceMs;
       sigkillTimer = setTimeout(() => {
-        const killedBySigkill = child.kill("SIGKILL");
-        writeCodexDiagnostic({
-          event: "timeout_sigkill_sent",
-          ...diagnosticContext,
-          durationMs: Date.now() - startedAt,
-          killed: killedBySigkill,
-        });
+        sendTimeoutKill("terminate_grace");
       }, codexTerminateGraceMs);
+      sigkillTimer.unref?.();
+    };
+    if (codexNearTimeoutCancelEnabled) {
+      cancelTimer = setTimeout(() => {
+        sendTimeoutCancel("near_timeout_cancel");
+      }, codexNearTimeoutCancelMs);
+      cancelTimer.unref?.();
+    }
+    hardTimeoutTimer = setTimeout(() => {
+      if (timeoutCancelSent && scheduledSigkillAt != null && scheduledSigkillAt <= startedAt + codexTimeoutMs) {
+        return;
+      }
+      if (!timeoutCancelSent) sendTimeoutCancel("hard_timeout");
+      sendTimeoutKill("hard_timeout");
     }, codexTimeoutMs);
+    hardTimeoutTimer.unref?.();
 
     scheduleStatusUpdate(codexStatusInitialMs);
+    scheduleTimeoutWarning();
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -338,8 +403,10 @@ async function runCodex(state, inbound) {
     });
     child.on("error", (error) => {
       codexRunning = false;
-      clearTimeout(timer);
+      if (cancelTimer) clearTimeout(cancelTimer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (hardTimeoutTimer) clearTimeout(hardTimeoutTimer);
+      if (warningTimer) clearTimeout(warningTimer);
       clearStatusTimer();
       writeCodexDiagnostic({
         event: "spawn_error",
@@ -355,8 +422,10 @@ async function runCodex(state, inbound) {
     });
     child.on("close", async (code, signal) => {
       codexRunning = false;
-      clearTimeout(timer);
+      if (cancelTimer) clearTimeout(cancelTimer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (hardTimeoutTimer) clearTimeout(hardTimeoutTimer);
+      if (warningTimer) clearTimeout(warningTimer);
       clearStatusTimer();
       const lastMessage = await fs.readFile(outputPath, "utf8").catch(() => "");
       const outputTail = tailDiagnosticText(lastMessage);
@@ -403,20 +472,39 @@ async function sendTransformMessage(state, inbound, message, busy = false) {
   await apiPost("/api/transform", body);
 }
 
+export function buildCodexStatusUpdateMessage(status, timeoutMs = codexTimeoutMs) {
+  return [
+    "Codex #6 status heartbeat",
+    `- Task: ${redactedTaskPreview}`,
+    `- Elapsed: ${formatElapsed(status.durationMs)}`,
+    `- Hard cutoff: ${formatElapsed(timeoutMs)}`,
+    `- Last exec output: ${status.lastOutputAt || "(none yet)"}`,
+    "- State: codex exec is still running; final reply will be sent when it completes.",
+  ].join("\n");
+}
+
+export function buildCodexTimeoutWarningMessage(
+  status,
+  timeoutMs = codexTimeoutMs,
+  cancelMs = codexNearTimeoutCancelMs,
+) {
+  return [
+    "Codex #6 timeout warning",
+    `- Task: ${redactedTaskPreview}`,
+    `- Elapsed: ${formatElapsed(status.durationMs)}`,
+    `- Cancel signal: ${formatElapsed(cancelMs)}`,
+    `- Hard cutoff: ${formatElapsed(timeoutMs)}`,
+    `- Last exec output: ${status.lastOutputAt || "(none yet)"}`,
+    "- State: codex exec is still running; SIGTERM will be sent at the cancel threshold if it does not finish.",
+  ].join("\n");
+}
+
 async function sendCodexStatusUpdate(state, inbound, status) {
-  await sendTransformMessage(
-    state,
-    inbound,
-    [
-      "Codex #6 status heartbeat",
-      `- Task: ${summarizeText(status.prompt) || "(unknown task)"}`,
-      `- Elapsed: ${formatElapsed(status.durationMs)}`,
-      `- Timeout limit: ${formatElapsed(codexTimeoutMs)}`,
-      `- Last exec output: ${status.lastOutputAt || "(none yet)"}`,
-      "- State: codex exec is still running; final reply will be sent when it completes.",
-    ].join("\n"),
-    true,
-  );
+  await sendTransformMessage(state, inbound, buildCodexStatusUpdateMessage(status), true);
+}
+
+async function sendCodexTimeoutWarning(state, inbound, status) {
+  await sendTransformMessage(state, inbound, buildCodexTimeoutWarningMessage(status), true);
 }
 
 async function sendReply(state, inbound, reply) {
@@ -483,6 +571,11 @@ async function main() {
     codexSandbox,
     codexBypassApprovals,
     codexTimeoutMs,
+    codexNearTimeoutWarningMs,
+    codexNearTimeoutWarningEnabled,
+    codexNearTimeoutCancelMs,
+    codexNearTimeoutCancelEnabled,
+    codexTerminateGraceMs,
     codexStatusUpdatesEnabled,
     codexStatusInitialMs,
     codexStatusMs,
@@ -505,7 +598,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

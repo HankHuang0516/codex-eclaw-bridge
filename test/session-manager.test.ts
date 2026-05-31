@@ -48,6 +48,15 @@ class MockCodex extends EventEmitter {
   }
 }
 
+class PendingCodex extends EventEmitter {
+  async request(method: string): Promise<any> {
+    if (method === "thread/start") return { thread: { id: "thread_1" } };
+    if (method === "turn/start") return { turn: { id: "turn_1" } };
+    if (method === "turn/interrupt") return {};
+    return {};
+  }
+}
+
 describe("deriveSenderHint", () => {
   it("maps bot-to-bot fromEntityId to kind=entity with publicCode passthrough", () => {
     const hint = deriveSenderHint({
@@ -99,6 +108,38 @@ describe("SessionManager.sendCodexReply", () => {
     const lastCall = eclaw.sendMessage.mock.calls.at(-1);
     expect(lastCall?.[1]).toBe("the reply");
     expect(lastCall?.[2].senderHint).toEqual({ kind: "entity", entityId: 5, publicCode: "abc123" });
+  });
+});
+
+describe("SessionManager.status", () => {
+  it("does not expose the active inbound prompt", async () => {
+    const state: BridgeState = { deviceId: "dev", entityId: 1, botSecret: "secret" };
+    const stateStore = {
+      read: vi.fn().mockResolvedValue(state),
+      write: vi.fn().mockResolvedValue(undefined),
+      clearThread: vi.fn(),
+    };
+    const eclaw = {
+      sendMessage: vi.fn().mockResolvedValue({ success: true }),
+      getPromptPolicy: vi.fn().mockResolvedValue(null),
+      getRoutingPolicy: vi.fn().mockResolvedValue(""),
+    };
+    const manager = new SessionManager(config, new PendingCodex() as any, eclaw as any, stateStore as any);
+    const fakeBotSecret = "fake-bot-secret-123456";
+    const pending = manager.handleInbound({
+      deviceId: "dev",
+      entityId: 1,
+      text: `curl -d '{"botSecret":"${fakeBotSecret}"}'`,
+    });
+
+    await vi.waitFor(() => expect(manager.status().activeTurnId).toBe("turn_1"));
+    const status = manager.status();
+    expect(status.activePrompt).toBe("[redacted]");
+    expect(JSON.stringify(status)).not.toContain(fakeBotSecret);
+    expect(JSON.stringify(status)).not.toContain("botSecret");
+
+    await manager.interrupt();
+    await expect(pending).resolves.toBe("");
   });
 });
 

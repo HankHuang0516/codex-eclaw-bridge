@@ -22,7 +22,6 @@ type ActiveTurn = {
   threadId: string;
   turnId?: string;
   text: string;
-  prompt: string;
   startedAt: number;
   lastActivityAt: number;
   lastEvent?: string;
@@ -30,6 +29,8 @@ type ActiveTurn = {
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
 };
+
+const REDACTED_ACTIVE_PROMPT = "[redacted]";
 
 export class SessionManager {
   private activeTurn?: ActiveTurn;
@@ -109,7 +110,7 @@ export class SessionManager {
     }
     const state = await this.stateStore.read();
     const threadId = await this.ensureThread();
-    const turnPromise = this.waitForTurn(threadId, payload.text ?? "");
+    const turnPromise = this.waitForTurn(threadId);
     if (this.config.bridgeSendBusyUpdates) {
       // Busy updates are status-only — don't trigger speakTo via senderHint
       // even when the inbound was bot-to-bot.
@@ -184,7 +185,7 @@ export class SessionManager {
     return {
       activeTurnId: this.activeTurn?.turnId,
       activeThreadId: this.activeTurn?.threadId,
-      activePrompt: this.activeTurn?.prompt,
+      activePrompt: this.activeTurn ? REDACTED_ACTIVE_PROMPT : undefined,
       activeStartedAt: this.activeTurn ? new Date(this.activeTurn.startedAt).toISOString() : undefined,
       activeElapsedMs: this.activeTurn ? now - this.activeTurn.startedAt : undefined,
       lastActivityAt: this.activeTurn ? new Date(this.activeTurn.lastActivityAt).toISOString() : undefined,
@@ -194,7 +195,7 @@ export class SessionManager {
     };
   }
 
-  private waitForTurn(threadId: string, prompt: string): Promise<string> {
+  private waitForTurn(threadId: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.activeTurn = undefined;
@@ -204,7 +205,6 @@ export class SessionManager {
       this.activeTurn = {
         threadId,
         text: "",
-        prompt: summarizePromptForStatus(prompt),
         startedAt: now,
         lastActivityAt: now,
         lastEvent: "turn/queued",

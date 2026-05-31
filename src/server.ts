@@ -194,19 +194,20 @@ export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean>
   return true;
 }
 
+const REDACTED_TASK_PREVIEW = "[task in progress - preview redacted to prevent secret leak]";
+
 export function buildStatusHeartbeatMessage(status: {
   session: ReturnType<SessionManager["status"]>;
   approvals: ReturnType<ApprovalRouter["status"]>;
   codex: ReturnType<CodexClient["status"]>;
 }): string {
   const elapsed = formatElapsed(status.session.activeElapsedMs ?? 0);
-  const prompt = status.session.activePrompt || "(unknown task)";
   const pendingApprovals = status.approvals.pending > 0
     ? `${status.approvals.pending} pending approval(s): ${status.approvals.askIds.join(", ")}`
     : "no pending approval";
   return [
     "Codex status heartbeat",
-    `- Task: ${prompt}`,
+    `- Task: ${REDACTED_TASK_PREVIEW}`,
     `- Elapsed: ${elapsed}`,
     `- Last event: ${status.session.lastEvent ?? "turn started"}`,
     `- Last activity: ${status.session.lastActivityAt ?? "(unknown)"}`,
