@@ -17,6 +17,7 @@ const config: BridgeConfig = {
   bridgeReplyTimeoutMs: 1000,
   bridgeApprovalTimeoutMs: 1000,
   bridgeSendBusyUpdates: false,
+  bridgeStopProgressUpdates: false,
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,

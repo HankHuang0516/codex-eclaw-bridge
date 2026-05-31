@@ -10,6 +10,15 @@ answer back through `POST /api/channel/message`.
 > Status: experimental. This bridge intentionally targets `codex app-server`,
 > which Codex CLI currently marks as experimental.
 
+> 📡 **Preferred routing path**: For LLM bridges like this one, the recommended
+> reply path is **channelKey + `/api/transform`** rather than `/api/channel/message`.
+> The transform path provides `@`-mention auto-routing, A2A queue side-effects, and
+> entity state management without storing `botSecret` in the bridge. The
+> `/api/channel/message` path (thin-pipe) remains valid for pure relay use cases
+> (Discord webhooks, IoT integrations). See
+> [channel-routing-paths.md](https://github.com/HankHuang0516/EClaw/blob/main/docs/specs/channel-routing-paths.md)
+> for the full decision guide.
+
 ## Architecture
 
 ```text
@@ -106,15 +115,37 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `CODEX_SANDBOX` |  | `workspace-write` | Codex sandbox |
 | `CODEX_APPROVAL_POLICY` |  | `on-request` | Codex approval policy |
 | `CODEX_APP_SERVER_LISTEN` |  | `ws://127.0.0.1:0` | App-server listen URL |
+| `CODEX_POLL_BRIDGE_BYPASS_APPROVALS` |  | `false` | Polling bridge only: pass `--dangerously-bypass-approvals-and-sandbox` to non-interactive `codex exec`, needed for unattended Computer Use app access |
+| `CODEX_POLL_BRIDGE_TIMEOUT_MS` |  | `1200000` | Polling bridge only: hard wall-clock cap for a `codex exec` turn |
+| `CODEX_POLL_BRIDGE_NEAR_TIMEOUT_WARNING_MS` |  | `900000` | Polling bridge only: send a redacted BUSY warning after this many milliseconds; set `0` to disable |
+| `CODEX_POLL_BRIDGE_NEAR_TIMEOUT_CANCEL_MS` |  | `1080000` | Polling bridge only: send SIGTERM after this many milliseconds, while preserving the hard wall-clock cap |
+| `CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS` |  | `120000` | Polling bridge only: grace period after timeout SIGTERM before SIGKILL |
+| `CODEX_POLL_BRIDGE_DIAGNOSTIC_LOG` |  | `.data/codex-exec-diagnostics.jsonl` | Polling bridge only: JSONL diagnostics for `codex exec` start, timeout, close, signal, stdout/stderr tails, and output tail |
+| `BUSY_HEARTBEAT_DISABLED` |  | `false` | Emergency kill switch for visible BUSY status updates (`true`/`1` disables heartbeats and timeout warnings) |
+| `CODEX_POLL_BRIDGE_STATUS_UPDATES` |  | `false` | Polling bridge only: send visible BUSY status heartbeats while `codex exec` is still running (`false`/`0` disables) |
+| `CODEX_POLL_BRIDGE_STATUS_INITIAL_MS` |  | `30000` | Polling bridge only: first status heartbeat delay after spawning `codex exec` |
+| `CODEX_POLL_BRIDGE_STATUS_MS` |  | `180000` | Polling bridge only: recurring status heartbeat interval while `codex exec` runs |
 | `BRIDGE_STATE_PATH` |  | `.data/state.json` | Runtime state path |
 | `BRIDGE_REPLY_TIMEOUT_MS` |  | `600000` | Turn reply timeout |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` |  | `900000` | Approval card timeout |
 | `BRIDGE_SEND_BUSY_UPDATES` |  | `false` | Send a persistent "working" message before turns |
-| `BRIDGE_STATUS_HEARTBEAT_ENABLED` |  | `true` | Send periodic long-task status updates while a Codex turn is active |
+| `BRIDGE_STATUS_HEARTBEAT_ENABLED` |  | `false` | Send periodic long-task status updates while a Codex turn is active |
 | `BRIDGE_STATUS_HEARTBEAT_MS` |  | `180000` | Status heartbeat interval |
 | `BRIDGE_REQUIRE_CALLBACK_AUTH` |  | `false` | Require configured callback auth |
 
 Never commit `.env`. `.gitignore` excludes `.env*` except `.env.example`.
+
+For the #6 polling bridge, `codex exec` has a 20-minute wall-clock budget. It
+sends a redacted timeout BUSY warning at 15 minutes, sends SIGTERM at 18
+minutes so Codex has a graceful cleanup window, sends SIGKILL after
+`CODEX_POLL_BRIDGE_TERMINATE_GRACE_MS` (2 minutes by default), and keeps the
+20-minute hard cap as a safety net. Polling bridge BUSY status heartbeats are
+still opt-in with
+`CODEX_POLL_BRIDGE_STATUS_UPDATES=true`; when enabled, their task preview is
+fixed redacted text and never echoes the inbound prompt. Timeout diagnostics are
+appended to `.data/codex-exec-diagnostics.jsonl` with redacted
+stdout/stderr/output tails, exit code/signal, and the SIGTERM/SIGKILL sequence
+used to stop a stuck `codex exec`.
 
 ## Bridge Commands
 
@@ -140,14 +171,15 @@ The bridge has two layers of progress visibility:
 1. Codex task protocol instructions tell Codex to start long work with a short
    test plan and report meaningful milestones instead of only sending a final
    answer.
-2. The bridge sends an external status heartbeat while a Codex turn is active.
-   This heartbeat does not rely on Codex choosing to speak; it reports the
-   active task summary, elapsed time, last observed Codex event, connection
+2. The bridge can send an external status heartbeat while a Codex turn is
+   active. This heartbeat does not rely on Codex choosing to speak; it reports
+   redacted task text, elapsed time, last observed Codex event, connection
    state, and whether any approval cards are pending.
 
-Default heartbeat interval is 3 minutes. Tune it with
-`BRIDGE_STATUS_HEARTBEAT_MS`, or disable it with
-`BRIDGE_STATUS_HEARTBEAT_ENABLED=false`.
+Status heartbeats are disabled by default. Enable them with
+`BRIDGE_STATUS_HEARTBEAT_ENABLED=true`, tune the interval with
+`BRIDGE_STATUS_HEARTBEAT_MS`, or force-disable both heartbeat paths with
+`BUSY_HEARTBEAT_DISABLED=true`.
 
 ## Central Prompt Policy
 
@@ -217,6 +249,21 @@ CODEX_APPROVAL_POLICY=on-request
 ```
 
 Keep `on-request` so command/file approvals still become EClaw rich cards.
+
+### Polling Bridge Computer Use
+
+The fallback polling bridge runs `codex exec` non-interactively. Computer Use
+app access is requested through MCP elicitation; without
+`CODEX_POLL_BRIDGE_BYPASS_APPROVALS=1`, those app-access requests are denied and
+the bot must report that Computer Use is blocked. For browser automation, use a
+real browser app such as Google Chrome or Safari. Computer Use intentionally
+blocks the Codex desktop app / in-app browser (`com.openai.codex`).
+
+For #6 on Hank's local fleet, run the polling bridge from the dedicated
+`codex-eclaw-cua` tmux socket rather than the legacy default tmux server. The
+old server can inherit a macOS Automation/TCC context that makes Chrome access
+fail with Apple event `-1743`; the dedicated socket preserves the desktop
+Computer Use context used by the working #6 browser-chat validation.
 
 ## Security Notes
 

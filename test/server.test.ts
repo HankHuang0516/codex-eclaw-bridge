@@ -19,6 +19,7 @@ const config: BridgeConfig = {
   bridgeReplyTimeoutMs: 1000,
   bridgeApprovalTimeoutMs: 1000,
   bridgeSendBusyUpdates: false,
+  bridgeStopProgressUpdates: false,
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,
@@ -140,12 +141,14 @@ describe("server", () => {
     });
   });
 
-  it("formats status heartbeat diagnostics", () => {
+  it("formats status heartbeat diagnostics without exposing the prompt", () => {
+    const fakeBotSecret = "fake-bot-secret-123456";
+    const fakeDeviceSecret = "fake-device-secret-654321";
     const message = buildStatusHeartbeatMessage({
       session: {
         activeTurnId: "turn_1",
         activeThreadId: "thread_1",
-        activePrompt: "Run QA sweep",
+        activePrompt: `curl -d '{"deviceId":"fake-device","botSecret":"${fakeBotSecret}","deviceSecret":"${fakeDeviceSecret}"}'`,
         activeElapsedMs: 7 * 60_000,
         lastActivityAt: "2026-05-01T10:00:00.000Z",
         lastEvent: "item:command",
@@ -156,7 +159,11 @@ describe("server", () => {
     });
 
     expect(message).toContain("Codex status heartbeat");
-    expect(message).toContain("Task: Run QA sweep");
+    expect(message).toContain("Task: [task in progress - preview redacted to prevent secret leak]");
+    expect(message).not.toContain(fakeBotSecret);
+    expect(message).not.toContain(fakeDeviceSecret);
+    expect(message).not.toContain("botSecret");
+    expect(message).not.toContain("deviceSecret");
     expect(message).toContain("Elapsed: 7m 0s");
     expect(message).toContain("Approvals: no pending approval");
   });

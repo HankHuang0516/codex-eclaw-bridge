@@ -22,6 +22,7 @@ export type BridgeConfig = {
   bridgeReplyTimeoutMs: number;
   bridgeApprovalTimeoutMs: number;
   bridgeSendBusyUpdates: boolean;
+  bridgeStopProgressUpdates: boolean;
   bridgeRequireCallbackAuth: boolean;
   bridgeStatusHeartbeatEnabled: boolean;
   bridgeStatusHeartbeatMs: number;

@@ -28,6 +28,17 @@ export type BridgeAppDeps = {
 
 export function createApp(deps: BridgeAppDeps): express.Express {
   const app = express();
+  const webhookBasePath = getWebhookBasePath(deps.config.eclawWebhookUrl);
+  if (webhookBasePath) {
+    app.use((req, _res, next) => {
+      if (req.url === webhookBasePath) {
+        req.url = "/";
+      } else if (req.url.startsWith(`${webhookBasePath}/`)) {
+        req.url = req.url.slice(webhookBasePath.length);
+      }
+      next();
+    });
+  }
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/health", async (_req, res) => {
@@ -115,6 +126,15 @@ export function createApp(deps: BridgeAppDeps): express.Express {
   return app;
 }
 
+function getWebhookBasePath(webhookUrl: string): string {
+  try {
+    const pathname = new URL(webhookUrl).pathname.replace(/\/+$/, "");
+    return pathname === "/" ? "" : pathname;
+  } catch {
+    return "";
+  }
+}
+
 export async function bootstrap(): Promise<void> {
   const config = loadConfig();
   const stateStore = new StateStore(config.bridgeStatePath);
@@ -174,19 +194,20 @@ export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean>
   return true;
 }
 
+const REDACTED_TASK_PREVIEW = "[task in progress - preview redacted to prevent secret leak]";
+
 export function buildStatusHeartbeatMessage(status: {
   session: ReturnType<SessionManager["status"]>;
   approvals: ReturnType<ApprovalRouter["status"]>;
   codex: ReturnType<CodexClient["status"]>;
 }): string {
   const elapsed = formatElapsed(status.session.activeElapsedMs ?? 0);
-  const prompt = status.session.activePrompt || "(unknown task)";
   const pendingApprovals = status.approvals.pending > 0
     ? `${status.approvals.pending} pending approval(s): ${status.approvals.askIds.join(", ")}`
     : "no pending approval";
   return [
     "Codex status heartbeat",
-    `- Task: ${prompt}`,
+    `- Task: ${REDACTED_TASK_PREVIEW}`,
     `- Elapsed: ${elapsed}`,
     `- Last event: ${status.session.lastEvent ?? "turn started"}`,
     `- Last activity: ${status.session.lastActivityAt ?? "(unknown)"}`,
