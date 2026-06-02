@@ -150,6 +150,29 @@ function replyFor(text) {
   return null;
 }
 
+function hasDirectProbeReply(text) {
+  return /\bECLAW_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text)
+    || /reply with ['"]?pong-[A-Za-z0-9_-]+['"]?/i.test(text);
+}
+
+function isModelHealthProbe(text) {
+  return /\bMODEL_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text);
+}
+
+export function pollPriority(message) {
+  const text = String(message?.text || "");
+  if (hasDirectProbeReply(text)) return 0;
+  if (isModelHealthProbe(text)) return 1;
+  return 2;
+}
+
+export function prioritizePollMessages(messages) {
+  return messages
+    .map((message, index) => ({ message, index, priority: pollPriority(message) }))
+    .sort((a, b) => a.priority - b.priority || a.index - b.index)
+    .map((entry) => entry.message);
+}
+
 function compactError(error) {
   return String(error?.message || error || "unknown error")
     .replace(/\s+/g, " ")
@@ -520,6 +543,7 @@ async function pollOnce(state) {
     since: startMs,
   });
   const messages = data.messages || [];
+  const pending = [];
   for (const message of messages) {
     if (!message.id || seen.has(message.id)) continue;
 
@@ -542,6 +566,12 @@ async function pollOnce(state) {
       continue;
     }
 
+    pending.push(message);
+  }
+
+  for (const message of prioritizePollMessages(pending)) {
+    const text = String(message.text || "");
+    const source = String(message.source || "");
     let reply = replyFor(text);
     if (reply === null) {
       try {

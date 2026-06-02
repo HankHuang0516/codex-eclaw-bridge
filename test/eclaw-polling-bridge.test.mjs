@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildCodexStatusUpdateMessage,
   buildCodexTimeoutWarningMessage,
+  prioritizePollMessages,
 } from "../scripts/eclaw-polling-bridge.mjs";
 
 const childProcessMock = vi.hoisted(() => {
@@ -52,6 +53,17 @@ afterEach(async () => {
 });
 
 describe("eclaw polling bridge status heartbeat", () => {
+  it("prioritizes health probes ahead of long normal work in the same poll batch", () => {
+    const ordered = prioritizePollMessages([
+      { id: "long", text: "⏰ Task nudge: continue a long desktop architecture task" },
+      { id: "model", text: "MODEL_HEALTHCHECK MH6abc Do not run tools." },
+      { id: "ack", text: "ECLAW_HEALTHCHECK HC6abc\n請只回覆：ACK HC6abc" },
+      { id: "normal", text: "normal user request" },
+    ]);
+
+    expect(ordered.map((message) => message.id)).toEqual(["ack", "model", "long", "normal"]);
+  });
+
   it("redacts the active prompt preview", () => {
     const fakeBotSecret = "fake-bot-secret-123456";
     const fakeDeviceSecret = "fake-device-secret-654321";
