@@ -8,6 +8,7 @@ import {
   buildCodexStatusUpdateMessage,
   buildCodexTimeoutWarningMessage,
   prioritizePollMessages,
+  refreshEntitiesWithRetry,
 } from "../scripts/eclaw-polling-bridge.mjs";
 
 const childProcessMock = vi.hoisted(() => {
@@ -53,6 +54,39 @@ afterEach(async () => {
 });
 
 describe("eclaw polling bridge status heartbeat", () => {
+  it("keeps startup alive when the initial entity refresh is rate limited", async () => {
+    const refresh = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Too many requests — try again shortly"))
+      .mockResolvedValueOnce(undefined);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      refreshEntitiesWithRetry(
+        { deviceId: "dev", entityId: 6, botSecret: "secret" },
+        { attempts: 2, delayMs: 10, refresh, sleep, phase: "startup-test" },
+      ),
+    ).resolves.toBe(true);
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues with the current routing cache when startup refresh never recovers", async () => {
+    const refresh = vi.fn().mockRejectedValue(new Error("Too many requests — try again shortly"));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      refreshEntitiesWithRetry(
+        { deviceId: "dev", entityId: 6, botSecret: "secret" },
+        { attempts: 2, delayMs: 10, refresh, sleep, phase: "startup-test" },
+      ),
+    ).resolves.toBe(false);
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
   it("prioritizes health probes ahead of long normal work in the same poll batch", () => {
     const ordered = prioritizePollMessages([
       { id: "long", text: "⏰ Task nudge: continue a long desktop architecture task" },

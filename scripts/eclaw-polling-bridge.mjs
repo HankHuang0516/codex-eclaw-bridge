@@ -110,6 +110,10 @@ async function apiPost(pathname, body) {
   return data;
 }
 
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function refreshEntities(state) {
   const data = await apiGet("/api/entities", {
     deviceId: state.deviceId,
@@ -122,6 +126,39 @@ async function refreshEntities(state) {
       .filter((entity) => entity.publicCode && entity.entityId != null)
       .map((entity) => [Number(entity.entityId), entity.publicCode]),
   );
+}
+
+export async function refreshEntitiesWithRetry(state, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts ?? 6));
+  const delayMs = Math.max(0, Number(options.delayMs ?? 10_000));
+  const refresh = options.refresh ?? refreshEntities;
+  const sleepFn = options.sleep ?? sleep;
+  const phase = options.phase || "refresh";
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await refresh(state);
+      return true;
+    } catch (error) {
+      lastError = error;
+      log("entity cache refresh failed", {
+        phase,
+        attempt,
+        attempts,
+        error: compactError(error),
+      });
+      if (attempt < attempts && delayMs > 0) {
+        await sleepFn(delayMs);
+      }
+    }
+  }
+
+  log("entity cache refresh unavailable; continuing with current routing cache", {
+    phase,
+    error: compactError(lastError),
+  });
+  return false;
 }
 
 function senderEntityId(source) {
@@ -590,7 +627,7 @@ async function pollOnce(state) {
 
 async function main() {
   const state = await readState();
-  await refreshEntities(state);
+  await refreshEntitiesWithRetry(state, { phase: "startup" });
   log("codex polling bridge started", {
     deviceId: state.deviceId,
     entityId: state.entityId,
