@@ -55,11 +55,16 @@ const codexNearTimeoutWarningEnabled =
 const codexNearTimeoutCancelEnabled = codexNearTimeoutCancelMs > 0 && codexNearTimeoutCancelMs < codexTimeoutMs;
 const codexStatusInitialMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_INITIAL_MS, 30000);
 const codexStatusMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_MS, 180000);
+const directProbePollMs = positiveNumber(
+  process.env.ECLAW_DIRECT_PROBE_POLL_MS,
+  Math.max(1000, Math.min(3000, pollMs)),
+);
 const redactedTaskPreview = "[task in progress - preview redacted to prevent secret leak]";
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
 let entityCodeById = new Map();
+let directProbePollActive = false;
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), message, ...extra }));
@@ -208,6 +213,29 @@ export function prioritizePollMessages(messages) {
     .map((message, index) => ({ message, index, priority: pollPriority(message) }))
     .sort((a, b) => a.priority - b.priority || a.index - b.index)
     .map((entry) => entry.message);
+}
+
+function shouldSkipInboundMessage(message, state) {
+  if (!message?.id || seen.has(message.id)) return true;
+
+  const text = String(message.text || "");
+  if (!text.trim()) {
+    seen.add(message.id);
+    return true;
+  }
+  if (isOwnBotMessage(message, state)) {
+    seen.add(message.id);
+    return true;
+  }
+  if (/^ACK\b/.test(text.trim())) {
+    seen.add(message.id);
+    return true;
+  }
+  if (Number(message.entity_id) === state.entityId && /^ACK\b/.test(text.trim())) {
+    seen.add(message.id);
+    return true;
+  }
+  return false;
 }
 
 function compactError(error) {
@@ -582,31 +610,12 @@ async function pollOnce(state) {
   const messages = data.messages || [];
   const pending = [];
   for (const message of messages) {
-    if (!message.id || seen.has(message.id)) continue;
-
-    const text = String(message.text || "");
-    const source = String(message.source || "");
-    if (!text.trim()) {
-      seen.add(message.id);
-      continue;
-    }
-    if (isOwnBotMessage(message, state)) {
-      seen.add(message.id);
-      continue;
-    }
-    if (/^ACK\b/.test(text.trim())) {
-      seen.add(message.id);
-      continue;
-    }
-    if (Number(message.entity_id) === state.entityId && /^ACK\b/.test(text.trim())) {
-      seen.add(message.id);
-      continue;
-    }
-
+    if (shouldSkipInboundMessage(message, state)) continue;
     pending.push(message);
   }
 
   for (const message of prioritizePollMessages(pending)) {
+    if (seen.has(message.id)) continue;
     const text = String(message.text || "");
     const source = String(message.source || "");
     let reply = replyFor(text);
@@ -622,6 +631,41 @@ async function pollOnce(state) {
     await sendReply(state, message, reply.trim());
     seen.add(message.id);
     log("replied", { inboundId: message.id, source, replyPreview: reply.trim().slice(0, 80) });
+  }
+}
+
+async function pollDirectProbes(state) {
+  if (directProbePollActive) return;
+  directProbePollActive = true;
+  try {
+    const data = await apiGet("/api/chat/history", {
+      deviceId: state.deviceId,
+      entityId: state.entityId,
+      botSecret: state.botSecret,
+      limit: 30,
+      since: startMs,
+    });
+    for (const message of data.messages || []) {
+      if (shouldSkipInboundMessage(message, state)) continue;
+
+      const text = String(message.text || "");
+      if (!hasDirectProbeReply(text)) continue;
+
+      const reply = replyFor(text);
+      if (!reply || !reply.trim()) continue;
+
+      await sendReply(state, message, reply.trim());
+      seen.add(message.id);
+      log("direct_probe_replied", {
+        inboundId: message.id,
+        source: String(message.source || ""),
+        replyPreview: reply.trim().slice(0, 80),
+      });
+    }
+  } catch (error) {
+    log("direct probe poll error", { error: error.message });
+  } finally {
+    directProbePollActive = false;
   }
 }
 
@@ -648,7 +692,15 @@ async function main() {
     codexStatusMs,
     codexDiagnosticLog,
     pollMs,
+    directProbePollMs,
   });
+
+  setInterval(() => {
+    pollDirectProbes(state).catch((error) => {
+      log("direct probe poll fatal", { error: error.message });
+    });
+  }, directProbePollMs);
+  await pollDirectProbes(state);
 
   for (;;) {
     try {
