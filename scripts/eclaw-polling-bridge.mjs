@@ -25,7 +25,7 @@ const booleanFlag = (value, fallback) => {
 };
 const statePath = path.resolve(process.env.BRIDGE_STATE_PATH || path.join(root, ".data/state.json"));
 const workspace = process.env.CODEX_WORKSPACE || "/Users/hank/Desktop/Project";
-const pollMs = Number(process.env.ECLAW_POLL_MS || 4000);
+const pollMs = Number(process.env.ECLAW_POLL_MS || 30000);
 const useCodex = process.env.CODEX_POLL_BRIDGE_USE_CODEX === "1";
 const codexBin = process.env.CODEX_BIN || "codex";
 const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
@@ -57,7 +57,7 @@ const codexStatusInitialMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS
 const codexStatusMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_MS, 180000);
 const directProbePollMs = positiveNumber(
   process.env.ECLAW_DIRECT_PROBE_POLL_MS,
-  Math.max(1000, Math.min(3000, pollMs)),
+  Math.max(60000, pollMs * 2),
 );
 const redactedTaskPreview = "[task in progress - preview redacted to prevent secret leak]";
 
@@ -201,6 +201,10 @@ function isModelHealthProbe(text) {
   return /\bMODEL_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text);
 }
 
+function isSilentInbound(text) {
+  return /\[SILENT\]/i.test(String(text || ""));
+}
+
 export function pollPriority(message) {
   const text = String(message?.text || "");
   if (hasDirectProbeReply(text)) return 0;
@@ -220,6 +224,10 @@ function shouldSkipInboundMessage(message, state) {
 
   const text = String(message.text || "");
   if (!text.trim()) {
+    seen.add(message.id);
+    return true;
+  }
+  if (isSilentInbound(text)) {
     seen.add(message.id);
     return true;
   }
