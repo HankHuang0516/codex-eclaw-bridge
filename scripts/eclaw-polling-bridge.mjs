@@ -25,7 +25,7 @@ const booleanFlag = (value, fallback) => {
 };
 const statePath = path.resolve(process.env.BRIDGE_STATE_PATH || path.join(root, ".data/state.json"));
 const workspace = process.env.CODEX_WORKSPACE || "/Users/hank/Desktop/Project";
-const pollMs = Number(process.env.ECLAW_POLL_MS || 4000);
+const pollMs = Number(process.env.ECLAW_POLL_MS || 30000);
 const useCodex = process.env.CODEX_POLL_BRIDGE_USE_CODEX === "1";
 const codexBin = process.env.CODEX_BIN || "codex";
 const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
@@ -55,11 +55,16 @@ const codexNearTimeoutWarningEnabled =
 const codexNearTimeoutCancelEnabled = codexNearTimeoutCancelMs > 0 && codexNearTimeoutCancelMs < codexTimeoutMs;
 const codexStatusInitialMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_INITIAL_MS, 30000);
 const codexStatusMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_MS, 180000);
+const directProbePollMs = positiveNumber(
+  process.env.ECLAW_DIRECT_PROBE_POLL_MS,
+  Math.max(60000, pollMs * 2),
+);
 const redactedTaskPreview = "[task in progress - preview redacted to prevent secret leak]";
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
 let entityCodeById = new Map();
+let directProbePollActive = false;
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), message, ...extra }));
@@ -110,6 +115,10 @@ async function apiPost(pathname, body) {
   return data;
 }
 
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function refreshEntities(state) {
   const data = await apiGet("/api/entities", {
     deviceId: state.deviceId,
@@ -122,6 +131,39 @@ async function refreshEntities(state) {
       .filter((entity) => entity.publicCode && entity.entityId != null)
       .map((entity) => [Number(entity.entityId), entity.publicCode]),
   );
+}
+
+export async function refreshEntitiesWithRetry(state, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts ?? 6));
+  const delayMs = Math.max(0, Number(options.delayMs ?? 10_000));
+  const refresh = options.refresh ?? refreshEntities;
+  const sleepFn = options.sleep ?? sleep;
+  const phase = options.phase || "refresh";
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await refresh(state);
+      return true;
+    } catch (error) {
+      lastError = error;
+      log("entity cache refresh failed", {
+        phase,
+        attempt,
+        attempts,
+        error: compactError(error),
+      });
+      if (attempt < attempts && delayMs > 0) {
+        await sleepFn(delayMs);
+      }
+    }
+  }
+
+  log("entity cache refresh unavailable; continuing with current routing cache", {
+    phase,
+    error: compactError(lastError),
+  });
+  return false;
 }
 
 function senderEntityId(source) {
@@ -148,6 +190,60 @@ function replyFor(text) {
     return "Codex polling bridge is online. Message received.";
   }
   return null;
+}
+
+function hasDirectProbeReply(text) {
+  return /\bECLAW_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text)
+    || /reply with ['"]?pong-[A-Za-z0-9_-]+['"]?/i.test(text);
+}
+
+function isModelHealthProbe(text) {
+  return /\bMODEL_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text);
+}
+
+function isSilentInbound(text) {
+  return /\[SILENT\]/i.test(String(text || ""));
+}
+
+export function pollPriority(message) {
+  const text = String(message?.text || "");
+  if (hasDirectProbeReply(text)) return 0;
+  if (isModelHealthProbe(text)) return 1;
+  return 2;
+}
+
+export function prioritizePollMessages(messages) {
+  return messages
+    .map((message, index) => ({ message, index, priority: pollPriority(message) }))
+    .sort((a, b) => a.priority - b.priority || a.index - b.index)
+    .map((entry) => entry.message);
+}
+
+function shouldSkipInboundMessage(message, state) {
+  if (!message?.id || seen.has(message.id)) return true;
+
+  const text = String(message.text || "");
+  if (!text.trim()) {
+    seen.add(message.id);
+    return true;
+  }
+  if (isSilentInbound(text)) {
+    seen.add(message.id);
+    return true;
+  }
+  if (isOwnBotMessage(message, state)) {
+    seen.add(message.id);
+    return true;
+  }
+  if (/^ACK\b/.test(text.trim())) {
+    seen.add(message.id);
+    return true;
+  }
+  if (Number(message.entity_id) === state.entityId && /^ACK\b/.test(text.trim())) {
+    seen.add(message.id);
+    return true;
+  }
+  return false;
 }
 
 function compactError(error) {
@@ -520,28 +616,16 @@ async function pollOnce(state) {
     since: startMs,
   });
   const messages = data.messages || [];
+  const pending = [];
   for (const message of messages) {
-    if (!message.id || seen.has(message.id)) continue;
+    if (shouldSkipInboundMessage(message, state)) continue;
+    pending.push(message);
+  }
 
+  for (const message of prioritizePollMessages(pending)) {
+    if (seen.has(message.id)) continue;
     const text = String(message.text || "");
     const source = String(message.source || "");
-    if (!text.trim()) {
-      seen.add(message.id);
-      continue;
-    }
-    if (isOwnBotMessage(message, state)) {
-      seen.add(message.id);
-      continue;
-    }
-    if (/^ACK\b/.test(text.trim())) {
-      seen.add(message.id);
-      continue;
-    }
-    if (Number(message.entity_id) === state.entityId && /^ACK\b/.test(text.trim())) {
-      seen.add(message.id);
-      continue;
-    }
-
     let reply = replyFor(text);
     if (reply === null) {
       try {
@@ -558,9 +642,44 @@ async function pollOnce(state) {
   }
 }
 
+async function pollDirectProbes(state) {
+  if (directProbePollActive) return;
+  directProbePollActive = true;
+  try {
+    const data = await apiGet("/api/chat/history", {
+      deviceId: state.deviceId,
+      entityId: state.entityId,
+      botSecret: state.botSecret,
+      limit: 30,
+      since: startMs,
+    });
+    for (const message of data.messages || []) {
+      if (shouldSkipInboundMessage(message, state)) continue;
+
+      const text = String(message.text || "");
+      if (!hasDirectProbeReply(text)) continue;
+
+      const reply = replyFor(text);
+      if (!reply || !reply.trim()) continue;
+
+      await sendReply(state, message, reply.trim());
+      seen.add(message.id);
+      log("direct_probe_replied", {
+        inboundId: message.id,
+        source: String(message.source || ""),
+        replyPreview: reply.trim().slice(0, 80),
+      });
+    }
+  } catch (error) {
+    log("direct probe poll error", { error: error.message });
+  } finally {
+    directProbePollActive = false;
+  }
+}
+
 async function main() {
   const state = await readState();
-  await refreshEntities(state);
+  await refreshEntitiesWithRetry(state, { phase: "startup" });
   log("codex polling bridge started", {
     deviceId: state.deviceId,
     entityId: state.entityId,
@@ -581,7 +700,15 @@ async function main() {
     codexStatusMs,
     codexDiagnosticLog,
     pollMs,
+    directProbePollMs,
   });
+
+  setInterval(() => {
+    pollDirectProbes(state).catch((error) => {
+      log("direct probe poll fatal", { error: error.message });
+    });
+  }, directProbePollMs);
+  await pollDirectProbes(state);
 
   for (;;) {
     try {

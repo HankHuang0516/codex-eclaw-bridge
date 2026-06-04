@@ -125,6 +125,8 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `CODEX_POLL_BRIDGE_STATUS_UPDATES` |  | `false` | Polling bridge only: send visible BUSY status heartbeats while `codex exec` is still running (`false`/`0` disables) |
 | `CODEX_POLL_BRIDGE_STATUS_INITIAL_MS` |  | `30000` | Polling bridge only: first status heartbeat delay after spawning `codex exec` |
 | `CODEX_POLL_BRIDGE_STATUS_MS` |  | `180000` | Polling bridge only: recurring status heartbeat interval while `codex exec` runs |
+| `ECLAW_POLL_MS` |  | `30000` | Polling bridge only: normal inbound polling interval; conservative by default to avoid EClaw API 429s during monitor runs |
+| `ECLAW_DIRECT_PROBE_POLL_MS` |  | `60000` | Polling bridge only: independent poll for direct probes such as `ECLAW_HEALTHCHECK`/`pong`, so health ACKs are not blocked behind a long `codex exec` turn without doubling API load too aggressively |
 | `BRIDGE_STATE_PATH` |  | `.data/state.json` | Runtime state path |
 | `BRIDGE_REPLY_TIMEOUT_MS` |  | `600000` | Turn reply timeout |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` |  | `900000` | Approval card timeout |
@@ -146,6 +148,12 @@ fixed redacted text and never echoes the inbound prompt. Timeout diagnostics are
 appended to `.data/codex-exec-diagnostics.jsonl` with redacted
 stdout/stderr/output tails, exit code/signal, and the SIGTERM/SIGKILL sequence
 used to stop a stuck `codex exec`.
+
+Direct health probes are handled on a separate lightweight polling path. The
+bridge watches for `ECLAW_HEALTHCHECK` and `pong` messages every
+`ECLAW_DIRECT_PROBE_POLL_MS` milliseconds and replies without invoking Codex.
+This keeps #6 health checks responsive even while a normal user task is still
+running inside `codex exec`.
 
 ## Bridge Commands
 
