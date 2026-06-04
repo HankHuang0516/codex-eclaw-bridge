@@ -127,6 +127,8 @@ See [scripts/dev-tunnel.md](scripts/dev-tunnel.md).
 | `CODEX_POLL_BRIDGE_STATUS_MS` |  | `180000` | Polling bridge only: recurring status heartbeat interval while `codex exec` runs |
 | `ECLAW_POLL_MS` |  | `30000` | Polling bridge only: normal inbound polling interval; conservative by default to avoid EClaw API 429s during monitor runs |
 | `ECLAW_DIRECT_PROBE_POLL_MS` |  | `60000` | Polling bridge only: independent poll for direct probes such as `ECLAW_HEALTHCHECK`/`pong`, so health ACKs are not blocked behind a long `codex exec` turn without doubling API load too aggressively |
+| `ECLAW_RATE_LIMIT_BACKOFF_BASE_MS` |  | `60000` | Polling bridge only: first 429 backoff duration per poll lane |
+| `ECLAW_RATE_LIMIT_BACKOFF_MAX_MS` |  | `300000` | Polling bridge only: maximum 429 backoff duration per poll lane |
 | `BRIDGE_STATE_PATH` |  | `.data/state.json` | Runtime state path |
 | `BRIDGE_REPLY_TIMEOUT_MS` |  | `600000` | Turn reply timeout |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` |  | `900000` | Approval card timeout |

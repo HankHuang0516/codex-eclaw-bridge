@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildCodexStatusUpdateMessage,
   buildCodexTimeoutWarningMessage,
+  isRateLimitError,
+  nextRateLimitBackoffMs,
   prioritizePollMessages,
   refreshEntitiesWithRetry,
 } from "../scripts/eclaw-polling-bridge.mjs";
@@ -96,6 +98,18 @@ describe("eclaw polling bridge status heartbeat", () => {
     ]);
 
     expect(ordered.map((message) => message.id)).toEqual(["ack", "model", "long", "normal"]);
+  });
+
+  it("detects rate-limit errors and caps exponential backoff", () => {
+    const statusError = new Error("server busy");
+    statusError.status = 429;
+
+    expect(isRateLimitError(statusError)).toBe(true);
+    expect(isRateLimitError(new Error("Too many requests — try again shortly"))).toBe(true);
+    expect(isRateLimitError(new Error("network offline"))).toBe(false);
+    expect(nextRateLimitBackoffMs(1, { baseMs: 1000, maxMs: 5000 })).toBe(1000);
+    expect(nextRateLimitBackoffMs(2, { baseMs: 1000, maxMs: 5000 })).toBe(2000);
+    expect(nextRateLimitBackoffMs(10, { baseMs: 1000, maxMs: 5000 })).toBe(5000);
   });
 
   it("redacts the active prompt preview", () => {

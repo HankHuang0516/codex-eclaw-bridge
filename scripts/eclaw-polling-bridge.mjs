@@ -59,12 +59,18 @@ const directProbePollMs = positiveNumber(
   process.env.ECLAW_DIRECT_PROBE_POLL_MS,
   Math.max(60000, pollMs * 2),
 );
+const rateLimitBackoffBaseMs = positiveNumber(process.env.ECLAW_RATE_LIMIT_BACKOFF_BASE_MS, 60_000);
+const rateLimitBackoffMaxMs = positiveNumber(process.env.ECLAW_RATE_LIMIT_BACKOFF_MAX_MS, 5 * 60_000);
 const redactedTaskPreview = "[task in progress - preview redacted to prevent secret leak]";
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
 let entityCodeById = new Map();
 let directProbePollActive = false;
+const rateLimitState = {
+  poll: { failures: 0, until: 0 },
+  directProbe: { failures: 0, until: 0 },
+};
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), message, ...extra }));
@@ -97,7 +103,10 @@ async function apiGet(pathname, query) {
   const res = await fetch(url);
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.success === false) {
-    throw new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    const error = new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    error.status = res.status;
+    error.retryAfter = res.headers.get("retry-after");
+    throw error;
   }
   return data;
 }
@@ -110,13 +119,55 @@ async function apiPost(pathname, body) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.success === false) {
-    throw new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    const error = new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    error.status = res.status;
+    error.retryAfter = res.headers.get("retry-after");
+    throw error;
   }
   return data;
 }
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isRateLimitError(error) {
+  return Number(error?.status) === 429 || /too many|rate.?limit/i.test(String(error?.message || error || ""));
+}
+
+export function nextRateLimitBackoffMs(failures, options = {}) {
+  const baseMs = positiveNumber(options.baseMs, rateLimitBackoffBaseMs);
+  const maxMs = positiveNumber(options.maxMs, rateLimitBackoffMaxMs);
+  const exponent = Math.max(0, Math.min(8, Number(failures || 1) - 1));
+  return Math.min(maxMs, baseMs * (2 ** exponent));
+}
+
+function rateLimitRemainingMs(kind, now = Date.now()) {
+  return Math.max(0, (rateLimitState[kind]?.until || 0) - now);
+}
+
+function recordRateLimit(kind, error) {
+  const state = rateLimitState[kind];
+  if (!state) return 0;
+  state.failures += 1;
+  const retryAfterMs = Number(error?.retryAfter) > 0 ? Number(error.retryAfter) * 1000 : 0;
+  const delayMs = Math.max(retryAfterMs, nextRateLimitBackoffMs(state.failures));
+  state.until = Date.now() + delayMs;
+  log("rate_limit_backoff", {
+    kind,
+    failures: state.failures,
+    delayMs,
+    until: new Date(state.until).toISOString(),
+    error: compactError(error),
+  });
+  return delayMs;
+}
+
+function clearRateLimit(kind) {
+  const state = rateLimitState[kind];
+  if (!state) return;
+  state.failures = 0;
+  state.until = 0;
 }
 
 async function refreshEntities(state) {
@@ -644,6 +695,11 @@ async function pollOnce(state) {
 
 async function pollDirectProbes(state) {
   if (directProbePollActive) return;
+  const backoffMs = rateLimitRemainingMs("directProbe");
+  if (backoffMs > 0) {
+    log("direct probe poll deferred by rate limit backoff", { remainingMs: backoffMs });
+    return;
+  }
   directProbePollActive = true;
   try {
     const data = await apiGet("/api/chat/history", {
@@ -670,8 +726,10 @@ async function pollDirectProbes(state) {
         replyPreview: reply.trim().slice(0, 80),
       });
     }
+    clearRateLimit("directProbe");
   } catch (error) {
     log("direct probe poll error", { error: error.message });
+    if (isRateLimitError(error)) recordRateLimit("directProbe", error);
   } finally {
     directProbePollActive = false;
   }
@@ -712,16 +770,27 @@ async function main() {
 
   for (;;) {
     try {
+      const backoffMs = rateLimitRemainingMs("poll");
+      if (backoffMs > 0) {
+        log("poll deferred by rate limit backoff", { remainingMs: backoffMs });
+        await sleep(Math.min(backoffMs, pollMs));
+        continue;
+      }
       await pollOnce(state);
+      clearRateLimit("poll");
     } catch (error) {
       log("poll error", { error: error.message });
-      try {
-        await refreshEntities(state);
-      } catch {
-        // The next polling cycle will retry with the current routing cache.
+      if (isRateLimitError(error)) {
+        recordRateLimit("poll", error);
+      } else {
+        try {
+          await refreshEntities(state);
+        } catch {
+          // The next polling cycle will retry with the current routing cache.
+        }
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await sleep(pollMs);
   }
 }
 
