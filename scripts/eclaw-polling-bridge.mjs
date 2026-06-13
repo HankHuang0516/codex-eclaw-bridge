@@ -28,7 +28,18 @@ const workspace = process.env.CODEX_WORKSPACE || "/Users/hank/Desktop/Project";
 const pollMs = Number(process.env.ECLAW_POLL_MS || 30000);
 const useCodex = process.env.CODEX_POLL_BRIDGE_USE_CODEX === "1";
 const codexBin = process.env.CODEX_BIN || "codex";
-const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
+// #6 智慧默認使用新模型: when CODEX_MODEL is unset or a sentinel (latest/auto/default), resolve
+// the newest model from codex-model-policy.json (latest[0]); a concrete CODEX_MODEL pin is honored.
+// Known-good fallback gpt-5.5. (Codex CLI has no model-list API, so the policy list is the source.)
+const codexModel = (() => {
+  const raw = (process.env.CODEX_MODEL || "").trim();
+  if (!["", "latest", "auto", "default"].includes(raw.toLowerCase())) return raw;
+  try {
+    const pol = JSON.parse(fsSync.readFileSync(path.join(root, "codex-model-policy.json"), "utf8"));
+    if (Array.isArray(pol.latest) && pol.latest[0]) return String(pol.latest[0]);
+  } catch { /* ignore — fall back below */ }
+  return "gpt-5.5";
+})();
 const codexReasoningEffort = process.env.CODEX_REASONING_EFFORT || "xhigh";
 const codexReportModel = process.env.CODEX_REPORT_MODEL || "GPT-5.5";
 const codexReportReasoning = process.env.CODEX_REPORT_REASONING || "extrahigh";
@@ -677,6 +688,16 @@ async function pollOnce(state) {
     if (seen.has(message.id)) continue;
     const text = String(message.text || "");
     const source = String(message.source || "");
+    const selfRepair = /\bECLAW_SELF_REPAIR\s+([A-Za-z0-9_-]+)/.exec(text);
+    if (selfRepair) {
+      log("self_repair_directive", { inboundId: message.id, nonce: selfRepair[1] });
+      try { await sendReply(state, message, `ACK ${selfRepair[1]} self-repair: restarting`); } catch (e) { /* best effort */ }
+      seen.add(message.id);
+      // In-place restart; the tmux supervisor loop (while true) relaunches the poller,
+      // which re-binds on startup. passive-health re-checks health afterward.
+      setTimeout(() => process.exit(0), 400);
+      return;
+    }
     let reply = replyFor(text);
     if (reply === null) {
       try {
