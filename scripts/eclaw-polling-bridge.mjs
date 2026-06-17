@@ -83,6 +83,56 @@ const rateLimitState = {
   directProbe: { failures: 0, until: 0 },
 };
 
+// ── Health heartbeat + in-process self-repair ────────────────────────────────
+// Root cause this fixes (2026-06-17): a wedged / crash-looping poller kept replying
+// "healthy" while it could not actually answer the user — health must honestly go RED on
+// sustained poll errors and trigger self-repair, instead of silently looping forever.
+// The poller is a POLLING bridge (no callback), so EClaw passive-health cannot key off a
+// callback URL; the single source of health truth is this heartbeat file, written every
+// loop iteration. An external watchdog (scripts/poller-watchdog.mjs) reads it to catch the
+// *wedge* case the tmux supervisor cannot (a hung poller never exits, so `while true` never
+// relaunches it).
+const heartbeatPath = path.resolve(
+  process.env.CODEX_POLL_BRIDGE_HEARTBEAT || path.join(root, ".data/poll-heartbeat.json"),
+);
+// After this many consecutive non-rate-limit poll errors, exit non-zero so the tmux
+// supervisor relaunches a fresh process (clears wedged sockets / transient EINTR state).
+// This is the in-process "red -> self-repair" path; it does NOT depend on an inbound
+// ECLAW_SELF_REPAIR message, which a broken poller can never receive.
+const pollErrorRestartThreshold = positiveNumber(
+  process.env.CODEX_POLL_BRIDGE_ERROR_RESTART_THRESHOLD,
+  5,
+);
+let consecutivePollErrors = 0;
+const bridgeStartedAtIso = new Date().toISOString();
+// phase: starting | idle | polling | codex_exec | rate_limited
+const heartbeat = {
+  startedAt: bridgeStartedAtIso,
+  pid: process.pid,
+  pollMs,
+  codexTimeoutMs,
+  errorRestartThreshold: pollErrorRestartThreshold,
+  phase: "starting",
+  phaseSince: bridgeStartedAtIso,
+  lastPollOk: null,
+  consecutiveErrors: 0,
+  note: "",
+  entityId: null,
+  ts: bridgeStartedAtIso,
+};
+function bumpHeartbeat(patch = {}) {
+  const ts = new Date().toISOString();
+  if (patch.phase && patch.phase !== heartbeat.phase) heartbeat.phaseSince = ts;
+  Object.assign(heartbeat, patch);
+  heartbeat.consecutiveErrors = consecutivePollErrors;
+  heartbeat.ts = ts;
+  try {
+    fsSync.writeFileSync(heartbeatPath, JSON.stringify(heartbeat));
+  } catch {
+    /* best effort — never let heartbeat IO crash the poll loop */
+  }
+}
+
 function log(message, extra = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), message, ...extra }));
 }
@@ -701,9 +751,14 @@ async function pollOnce(state) {
     let reply = replyFor(text);
     if (reply === null) {
       try {
+        // Mark codex_exec so the watchdog allows the full codex timeout window before
+        // treating a stale heartbeat as a wedge (a real codex run can take many minutes).
+        bumpHeartbeat({ phase: "codex_exec", note: `codex exec inbound=${message.id}` });
         reply = await runCodex(state, message);
       } catch (error) {
         reply = blockedReplyFor(text, error);
+      } finally {
+        bumpHeartbeat({ phase: "polling", note: "" });
       }
     }
     if (!reply || !reply.trim()) continue;
@@ -782,6 +837,9 @@ async function main() {
     directProbePollMs,
   });
 
+  // Seed the heartbeat immediately so the wedge watchdog has a fresh baseline from t=0.
+  bumpHeartbeat({ phase: "idle", lastPollOk: null, entityId: state.entityId, note: "started" });
+
   setInterval(() => {
     pollDirectProbes(state).catch((error) => {
       log("direct probe poll fatal", { error: error.message });
@@ -794,20 +852,42 @@ async function main() {
       const backoffMs = rateLimitRemainingMs("poll");
       if (backoffMs > 0) {
         log("poll deferred by rate limit backoff", { remainingMs: backoffMs });
+        // Rate-limit backoff is a healthy wait, not a failure — keep heartbeat fresh.
+        bumpHeartbeat({ phase: "rate_limited", lastPollOk: true, note: `backoff ${backoffMs}ms` });
         await sleep(Math.min(backoffMs, pollMs));
         continue;
       }
+      bumpHeartbeat({ phase: "polling" });
       await pollOnce(state);
       clearRateLimit("poll");
+      consecutivePollErrors = 0;
+      bumpHeartbeat({ phase: "idle", lastPollOk: true, note: "" });
     } catch (error) {
       log("poll error", { error: error.message });
       if (isRateLimitError(error)) {
         recordRateLimit("poll", error);
+        // Rate-limited ≠ unhealthy; don't count toward the self-repair threshold.
+        bumpHeartbeat({ phase: "rate_limited", lastPollOk: true, note: "rate_limited" });
       } else {
+        consecutivePollErrors += 1;
+        bumpHeartbeat({ phase: "idle", lastPollOk: false, note: String(error.message || error) });
         try {
           await refreshEntities(state);
         } catch {
           // The next polling cycle will retry with the current routing cache.
+        }
+        if (consecutivePollErrors >= pollErrorRestartThreshold) {
+          // Honest RED: sustained poll failures -> exit non-zero so the tmux supervisor
+          // relaunches a fresh poller. This is the self-repair Hank asked for, wired to
+          // the actual failure signal instead of staying green forever.
+          log("health_red_self_repair", {
+            consecutiveErrors: consecutivePollErrors,
+            threshold: pollErrorRestartThreshold,
+            action: "exit_nonzero_for_supervisor_relaunch",
+          });
+          bumpHeartbeat({ phase: "self_repair_exit", lastPollOk: false, note: "sustained_poll_errors" });
+          await sleep(500);
+          process.exit(2);
         }
       }
     }
