@@ -25,10 +25,21 @@ const booleanFlag = (value, fallback) => {
 };
 const statePath = path.resolve(process.env.BRIDGE_STATE_PATH || path.join(root, ".data/state.json"));
 const workspace = process.env.CODEX_WORKSPACE || "/Users/hank/Desktop/Project";
-const pollMs = Number(process.env.ECLAW_POLL_MS || 4000);
+const pollMs = Number(process.env.ECLAW_POLL_MS || 30000);
 const useCodex = process.env.CODEX_POLL_BRIDGE_USE_CODEX === "1";
 const codexBin = process.env.CODEX_BIN || "codex";
-const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
+// #6 智慧默認使用新模型: when CODEX_MODEL is unset or a sentinel (latest/auto/default), resolve
+// the newest model from codex-model-policy.json (latest[0]); a concrete CODEX_MODEL pin is honored.
+// Known-good fallback gpt-5.5. (Codex CLI has no model-list API, so the policy list is the source.)
+const codexModel = (() => {
+  const raw = (process.env.CODEX_MODEL || "").trim();
+  if (!["", "latest", "auto", "default"].includes(raw.toLowerCase())) return raw;
+  try {
+    const pol = JSON.parse(fsSync.readFileSync(path.join(root, "codex-model-policy.json"), "utf8"));
+    if (Array.isArray(pol.latest) && pol.latest[0]) return String(pol.latest[0]);
+  } catch { /* ignore — fall back below */ }
+  return "gpt-5.5";
+})();
 const codexReasoningEffort = process.env.CODEX_REASONING_EFFORT || "xhigh";
 const codexReportModel = process.env.CODEX_REPORT_MODEL || "GPT-5.5";
 const codexReportReasoning = process.env.CODEX_REPORT_REASONING || "extrahigh";
@@ -55,11 +66,72 @@ const codexNearTimeoutWarningEnabled =
 const codexNearTimeoutCancelEnabled = codexNearTimeoutCancelMs > 0 && codexNearTimeoutCancelMs < codexTimeoutMs;
 const codexStatusInitialMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_INITIAL_MS, 30000);
 const codexStatusMs = positiveNumber(process.env.CODEX_POLL_BRIDGE_STATUS_MS, 180000);
+const directProbePollMs = positiveNumber(
+  process.env.ECLAW_DIRECT_PROBE_POLL_MS,
+  Math.max(60000, pollMs * 2),
+);
+const rateLimitBackoffBaseMs = positiveNumber(process.env.ECLAW_RATE_LIMIT_BACKOFF_BASE_MS, 60_000);
+const rateLimitBackoffMaxMs = positiveNumber(process.env.ECLAW_RATE_LIMIT_BACKOFF_MAX_MS, 5 * 60_000);
 const redactedTaskPreview = "[task in progress - preview redacted to prevent secret leak]";
 
 const seen = new Set();
 const startMs = Date.now() - 5000;
 let entityCodeById = new Map();
+let directProbePollActive = false;
+const rateLimitState = {
+  poll: { failures: 0, until: 0 },
+  directProbe: { failures: 0, until: 0 },
+};
+
+// ── Health heartbeat + in-process self-repair ────────────────────────────────
+// Root cause this fixes (2026-06-17): a wedged / crash-looping poller kept replying
+// "healthy" while it could not actually answer the user — health must honestly go RED on
+// sustained poll errors and trigger self-repair, instead of silently looping forever.
+// The poller is a POLLING bridge (no callback), so EClaw passive-health cannot key off a
+// callback URL; the single source of health truth is this heartbeat file, written every
+// loop iteration. An external watchdog (scripts/poller-watchdog.mjs) reads it to catch the
+// *wedge* case the tmux supervisor cannot (a hung poller never exits, so `while true` never
+// relaunches it).
+const heartbeatPath = path.resolve(
+  process.env.CODEX_POLL_BRIDGE_HEARTBEAT || path.join(root, ".data/poll-heartbeat.json"),
+);
+// After this many consecutive non-rate-limit poll errors, exit non-zero so the tmux
+// supervisor relaunches a fresh process (clears wedged sockets / transient EINTR state).
+// This is the in-process "red -> self-repair" path; it does NOT depend on an inbound
+// ECLAW_SELF_REPAIR message, which a broken poller can never receive.
+const pollErrorRestartThreshold = positiveNumber(
+  process.env.CODEX_POLL_BRIDGE_ERROR_RESTART_THRESHOLD,
+  5,
+);
+let consecutivePollErrors = 0;
+const bridgeStartedAtIso = new Date().toISOString();
+// phase: starting | idle | polling | codex_exec | rate_limited
+const heartbeat = {
+  startedAt: bridgeStartedAtIso,
+  pid: process.pid,
+  pollMs,
+  codexTimeoutMs,
+  errorRestartThreshold: pollErrorRestartThreshold,
+  phase: "starting",
+  phaseSince: bridgeStartedAtIso,
+  lastPollOk: null,
+  consecutiveErrors: 0,
+  note: "",
+  entityId: null,
+  ts: bridgeStartedAtIso,
+};
+function bumpHeartbeat(patch = {}) {
+  const ts = new Date().toISOString();
+  if (patch.phase && patch.phase !== heartbeat.phase) heartbeat.phaseSince = ts;
+  Object.assign(heartbeat, patch);
+  heartbeat.consecutiveErrors = consecutivePollErrors;
+  heartbeat.ts = ts;
+  try {
+    fsSync.writeFileSync(heartbeatPath, JSON.stringify(heartbeat));
+  } catch {
+    /* best effort — never let heartbeat IO crash the poll loop */
+  }
+}
 
 function log(message, extra = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), message, ...extra }));
@@ -92,7 +164,10 @@ async function apiGet(pathname, query) {
   const res = await fetch(url);
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.success === false) {
-    throw new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    const error = new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    error.status = res.status;
+    error.retryAfter = res.headers.get("retry-after");
+    throw error;
   }
   return data;
 }
@@ -105,9 +180,55 @@ async function apiPost(pathname, body) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.success === false) {
-    throw new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    const error = new Error(data.message || data.error || `${pathname} failed with HTTP ${res.status}`);
+    error.status = res.status;
+    error.retryAfter = res.headers.get("retry-after");
+    throw error;
   }
   return data;
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isRateLimitError(error) {
+  return Number(error?.status) === 429 || /too many|rate.?limit/i.test(String(error?.message || error || ""));
+}
+
+export function nextRateLimitBackoffMs(failures, options = {}) {
+  const baseMs = positiveNumber(options.baseMs, rateLimitBackoffBaseMs);
+  const maxMs = positiveNumber(options.maxMs, rateLimitBackoffMaxMs);
+  const exponent = Math.max(0, Math.min(8, Number(failures || 1) - 1));
+  return Math.min(maxMs, baseMs * (2 ** exponent));
+}
+
+function rateLimitRemainingMs(kind, now = Date.now()) {
+  return Math.max(0, (rateLimitState[kind]?.until || 0) - now);
+}
+
+function recordRateLimit(kind, error) {
+  const state = rateLimitState[kind];
+  if (!state) return 0;
+  state.failures += 1;
+  const retryAfterMs = Number(error?.retryAfter) > 0 ? Number(error.retryAfter) * 1000 : 0;
+  const delayMs = Math.max(retryAfterMs, nextRateLimitBackoffMs(state.failures));
+  state.until = Date.now() + delayMs;
+  log("rate_limit_backoff", {
+    kind,
+    failures: state.failures,
+    delayMs,
+    until: new Date(state.until).toISOString(),
+    error: compactError(error),
+  });
+  return delayMs;
+}
+
+function clearRateLimit(kind) {
+  const state = rateLimitState[kind];
+  if (!state) return;
+  state.failures = 0;
+  state.until = 0;
 }
 
 async function refreshEntities(state) {
@@ -122,6 +243,39 @@ async function refreshEntities(state) {
       .filter((entity) => entity.publicCode && entity.entityId != null)
       .map((entity) => [Number(entity.entityId), entity.publicCode]),
   );
+}
+
+export async function refreshEntitiesWithRetry(state, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts ?? 6));
+  const delayMs = Math.max(0, Number(options.delayMs ?? 10_000));
+  const refresh = options.refresh ?? refreshEntities;
+  const sleepFn = options.sleep ?? sleep;
+  const phase = options.phase || "refresh";
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await refresh(state);
+      return true;
+    } catch (error) {
+      lastError = error;
+      log("entity cache refresh failed", {
+        phase,
+        attempt,
+        attempts,
+        error: compactError(error),
+      });
+      if (attempt < attempts && delayMs > 0) {
+        await sleepFn(delayMs);
+      }
+    }
+  }
+
+  log("entity cache refresh unavailable; continuing with current routing cache", {
+    phase,
+    error: compactError(lastError),
+  });
+  return false;
 }
 
 function senderEntityId(source) {
@@ -148,6 +302,60 @@ function replyFor(text) {
     return "Codex polling bridge is online. Message received.";
   }
   return null;
+}
+
+function hasDirectProbeReply(text) {
+  return /\bECLAW_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text)
+    || /reply with ['"]?pong-[A-Za-z0-9_-]+['"]?/i.test(text);
+}
+
+function isModelHealthProbe(text) {
+  return /\bMODEL_HEALTHCHECK\s+[A-Za-z0-9_-]+/.test(text);
+}
+
+function isSilentInbound(text) {
+  return /\[SILENT\]/i.test(String(text || ""));
+}
+
+export function pollPriority(message) {
+  const text = String(message?.text || "");
+  if (hasDirectProbeReply(text)) return 0;
+  if (isModelHealthProbe(text)) return 1;
+  return 2;
+}
+
+export function prioritizePollMessages(messages) {
+  return messages
+    .map((message, index) => ({ message, index, priority: pollPriority(message) }))
+    .sort((a, b) => a.priority - b.priority || a.index - b.index)
+    .map((entry) => entry.message);
+}
+
+function shouldSkipInboundMessage(message, state) {
+  if (!message?.id || seen.has(message.id)) return true;
+
+  const text = String(message.text || "");
+  if (!text.trim()) {
+    seen.add(message.id);
+    return true;
+  }
+  if (isSilentInbound(text)) {
+    seen.add(message.id);
+    return true;
+  }
+  if (isOwnBotMessage(message, state)) {
+    seen.add(message.id);
+    return true;
+  }
+  if (/^ACK\b/.test(text.trim())) {
+    seen.add(message.id);
+    return true;
+  }
+  if (Number(message.entity_id) === state.entityId && /^ACK\b/.test(text.trim())) {
+    seen.add(message.id);
+    return true;
+  }
+  return false;
 }
 
 function compactError(error) {
@@ -520,34 +728,37 @@ async function pollOnce(state) {
     since: startMs,
   });
   const messages = data.messages || [];
+  const pending = [];
   for (const message of messages) {
-    if (!message.id || seen.has(message.id)) continue;
+    if (shouldSkipInboundMessage(message, state)) continue;
+    pending.push(message);
+  }
 
+  for (const message of prioritizePollMessages(pending)) {
+    if (seen.has(message.id)) continue;
     const text = String(message.text || "");
     const source = String(message.source || "");
-    if (!text.trim()) {
+    const selfRepair = /\bECLAW_SELF_REPAIR\s+([A-Za-z0-9_-]+)/.exec(text);
+    if (selfRepair) {
+      log("self_repair_directive", { inboundId: message.id, nonce: selfRepair[1] });
+      try { await sendReply(state, message, `ACK ${selfRepair[1]} self-repair: restarting`); } catch (e) { /* best effort */ }
       seen.add(message.id);
-      continue;
+      // In-place restart; the tmux supervisor loop (while true) relaunches the poller,
+      // which re-binds on startup. passive-health re-checks health afterward.
+      setTimeout(() => process.exit(0), 400);
+      return;
     }
-    if (isOwnBotMessage(message, state)) {
-      seen.add(message.id);
-      continue;
-    }
-    if (/^ACK\b/.test(text.trim())) {
-      seen.add(message.id);
-      continue;
-    }
-    if (Number(message.entity_id) === state.entityId && /^ACK\b/.test(text.trim())) {
-      seen.add(message.id);
-      continue;
-    }
-
     let reply = replyFor(text);
     if (reply === null) {
       try {
+        // Mark codex_exec so the watchdog allows the full codex timeout window before
+        // treating a stale heartbeat as a wedge (a real codex run can take many minutes).
+        bumpHeartbeat({ phase: "codex_exec", note: `codex exec inbound=${message.id}` });
         reply = await runCodex(state, message);
       } catch (error) {
         reply = blockedReplyFor(text, error);
+      } finally {
+        bumpHeartbeat({ phase: "polling", note: "" });
       }
     }
     if (!reply || !reply.trim()) continue;
@@ -558,9 +769,51 @@ async function pollOnce(state) {
   }
 }
 
+async function pollDirectProbes(state) {
+  if (directProbePollActive) return;
+  const backoffMs = rateLimitRemainingMs("directProbe");
+  if (backoffMs > 0) {
+    log("direct probe poll deferred by rate limit backoff", { remainingMs: backoffMs });
+    return;
+  }
+  directProbePollActive = true;
+  try {
+    const data = await apiGet("/api/chat/history", {
+      deviceId: state.deviceId,
+      entityId: state.entityId,
+      botSecret: state.botSecret,
+      limit: 30,
+      since: startMs,
+    });
+    for (const message of data.messages || []) {
+      if (shouldSkipInboundMessage(message, state)) continue;
+
+      const text = String(message.text || "");
+      if (!hasDirectProbeReply(text)) continue;
+
+      const reply = replyFor(text);
+      if (!reply || !reply.trim()) continue;
+
+      await sendReply(state, message, reply.trim());
+      seen.add(message.id);
+      log("direct_probe_replied", {
+        inboundId: message.id,
+        source: String(message.source || ""),
+        replyPreview: reply.trim().slice(0, 80),
+      });
+    }
+    clearRateLimit("directProbe");
+  } catch (error) {
+    log("direct probe poll error", { error: error.message });
+    if (isRateLimitError(error)) recordRateLimit("directProbe", error);
+  } finally {
+    directProbePollActive = false;
+  }
+}
+
 async function main() {
   const state = await readState();
-  await refreshEntities(state);
+  await refreshEntitiesWithRetry(state, { phase: "startup" });
   log("codex polling bridge started", {
     deviceId: state.deviceId,
     entityId: state.entityId,
@@ -581,20 +834,64 @@ async function main() {
     codexStatusMs,
     codexDiagnosticLog,
     pollMs,
+    directProbePollMs,
   });
+
+  // Seed the heartbeat immediately so the wedge watchdog has a fresh baseline from t=0.
+  bumpHeartbeat({ phase: "idle", lastPollOk: null, entityId: state.entityId, note: "started" });
+
+  setInterval(() => {
+    pollDirectProbes(state).catch((error) => {
+      log("direct probe poll fatal", { error: error.message });
+    });
+  }, directProbePollMs);
+  await pollDirectProbes(state);
 
   for (;;) {
     try {
+      const backoffMs = rateLimitRemainingMs("poll");
+      if (backoffMs > 0) {
+        log("poll deferred by rate limit backoff", { remainingMs: backoffMs });
+        // Rate-limit backoff is a healthy wait, not a failure — keep heartbeat fresh.
+        bumpHeartbeat({ phase: "rate_limited", lastPollOk: true, note: `backoff ${backoffMs}ms` });
+        await sleep(Math.min(backoffMs, pollMs));
+        continue;
+      }
+      bumpHeartbeat({ phase: "polling" });
       await pollOnce(state);
+      clearRateLimit("poll");
+      consecutivePollErrors = 0;
+      bumpHeartbeat({ phase: "idle", lastPollOk: true, note: "" });
     } catch (error) {
       log("poll error", { error: error.message });
-      try {
-        await refreshEntities(state);
-      } catch {
-        // The next polling cycle will retry with the current routing cache.
+      if (isRateLimitError(error)) {
+        recordRateLimit("poll", error);
+        // Rate-limited ≠ unhealthy; don't count toward the self-repair threshold.
+        bumpHeartbeat({ phase: "rate_limited", lastPollOk: true, note: "rate_limited" });
+      } else {
+        consecutivePollErrors += 1;
+        bumpHeartbeat({ phase: "idle", lastPollOk: false, note: String(error.message || error) });
+        try {
+          await refreshEntities(state);
+        } catch {
+          // The next polling cycle will retry with the current routing cache.
+        }
+        if (consecutivePollErrors >= pollErrorRestartThreshold) {
+          // Honest RED: sustained poll failures -> exit non-zero so the tmux supervisor
+          // relaunches a fresh poller. This is the self-repair Hank asked for, wired to
+          // the actual failure signal instead of staying green forever.
+          log("health_red_self_repair", {
+            consecutiveErrors: consecutivePollErrors,
+            threshold: pollErrorRestartThreshold,
+            action: "exit_nonzero_for_supervisor_relaunch",
+          });
+          bumpHeartbeat({ phase: "self_repair_exit", lastPollOk: false, note: "sustained_poll_errors" });
+          await sleep(500);
+          process.exit(2);
+        }
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await sleep(pollMs);
   }
 }
 

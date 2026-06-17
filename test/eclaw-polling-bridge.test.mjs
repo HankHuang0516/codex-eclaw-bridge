@@ -7,6 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildCodexStatusUpdateMessage,
   buildCodexTimeoutWarningMessage,
+  isRateLimitError,
+  nextRateLimitBackoffMs,
+  prioritizePollMessages,
+  refreshEntitiesWithRetry,
 } from "../scripts/eclaw-polling-bridge.mjs";
 
 const childProcessMock = vi.hoisted(() => {
@@ -52,6 +56,62 @@ afterEach(async () => {
 });
 
 describe("eclaw polling bridge status heartbeat", () => {
+  it("keeps startup alive when the initial entity refresh is rate limited", async () => {
+    const refresh = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Too many requests — try again shortly"))
+      .mockResolvedValueOnce(undefined);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      refreshEntitiesWithRetry(
+        { deviceId: "dev", entityId: 6, botSecret: "secret" },
+        { attempts: 2, delayMs: 10, refresh, sleep, phase: "startup-test" },
+      ),
+    ).resolves.toBe(true);
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues with the current routing cache when startup refresh never recovers", async () => {
+    const refresh = vi.fn().mockRejectedValue(new Error("Too many requests — try again shortly"));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      refreshEntitiesWithRetry(
+        { deviceId: "dev", entityId: 6, botSecret: "secret" },
+        { attempts: 2, delayMs: 10, refresh, sleep, phase: "startup-test" },
+      ),
+    ).resolves.toBe(false);
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("prioritizes health probes ahead of long normal work in the same poll batch", () => {
+    const ordered = prioritizePollMessages([
+      { id: "long", text: "⏰ Task nudge: continue a long desktop architecture task" },
+      { id: "model", text: "MODEL_HEALTHCHECK MH6abc Do not run tools." },
+      { id: "ack", text: "ECLAW_HEALTHCHECK HC6abc\n請只回覆：ACK HC6abc" },
+      { id: "normal", text: "normal user request" },
+    ]);
+
+    expect(ordered.map((message) => message.id)).toEqual(["ack", "model", "long", "normal"]);
+  });
+
+  it("detects rate-limit errors and caps exponential backoff", () => {
+    const statusError = new Error("server busy");
+    statusError.status = 429;
+
+    expect(isRateLimitError(statusError)).toBe(true);
+    expect(isRateLimitError(new Error("Too many requests — try again shortly"))).toBe(true);
+    expect(isRateLimitError(new Error("network offline"))).toBe(false);
+    expect(nextRateLimitBackoffMs(1, { baseMs: 1000, maxMs: 5000 })).toBe(1000);
+    expect(nextRateLimitBackoffMs(2, { baseMs: 1000, maxMs: 5000 })).toBe(2000);
+    expect(nextRateLimitBackoffMs(10, { baseMs: 1000, maxMs: 5000 })).toBe(5000);
+  });
+
   it("redacts the active prompt preview", () => {
     const fakeBotSecret = "fake-bot-secret-123456";
     const fakeDeviceSecret = "fake-device-secret-654321";

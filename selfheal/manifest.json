@@ -1,0 +1,22 @@
+{
+  "channelType": "codex-eclaw-bridge",
+  "entityId": 6,
+  "repo": "HankHuang0516/codex-eclaw-bridge",
+  "branch": "main",
+  "selfRepairVersion": "1.0.0",
+  "selfRepairEntrypoint": "selfheal/self-repair.sh",
+  "repairCommand": "./scripts/restart-poller.sh",
+  "healthCheck": {
+    "type": "heartbeat",
+    "path": ".data/poll-heartbeat.json",
+    "maxAgeSec": 120,
+    "note": "Polling bridge has NO callback URL by design — health is heartbeat freshness + lastPollOk, NOT callback registration. EClaw passive-health must exempt this channelType from the no-callback check (see selfheal/LAYER2-eclaw-backend-proposal.md in claude-code-eclaw-channel)."
+  },
+  "bindVerify": {
+    "endpoint": "/api/chat/history",
+    "method": "GET",
+    "expectEntityId": 6,
+    "note": "Codex bridge re-binds via .data/state.json on startup (no /api/channel/bind). 'bind' verify = a successful authenticated poll of /api/chat/history."
+  },
+  "description": "Repo-bound, version-aware self-repair program for the #6 Codex polling bridge. Contract: detect-latest -> auto-install-latest -> repair (restart poller+watchdog) -> health-verify (heartbeat fresh) -> poll sync-verify."
+}
