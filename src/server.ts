@@ -7,7 +7,7 @@ import { ApprovalRouter } from "./approval-router.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
 import { SessionManager } from "./session-manager.js";
 import { StateStore } from "./state-store.js";
-import type { BridgeConfig, EClawCard, EClawInboundPayload } from "./types.js";
+import type { BridgeConfig, EClawCard, EClawInboundPayload, RuntimeState } from "./types.js";
 
 const MODEL_PICKER_ASK_ID = "codex_model_picker";
 const MODEL_OPTIONS = [
@@ -154,8 +154,11 @@ export async function bootstrap(): Promise<void> {
 
   await registerAndBind(eclaw, stateStore);
 
-  const app = createApp({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
-  const heartbeat = startStatusHeartbeat({ config, codex, eclaw, stateStore, sessionManager, approvalRouter });
+  const deps = { config, codex, eclaw, stateStore, sessionManager, approvalRouter };
+  const app = createApp(deps);
+  const heartbeat = startStatusHeartbeat(deps);
+  // card_35cb55fc: forward real runtimeState (busy/stuck/crashed/idle) for the wallpaper.
+  const runtimeHeartbeat = startRuntimeStateHeartbeat(deps);
   app.listen(config.eclawWebhookPort, () => {
     console.log(`[bridge] listening on http://localhost:${config.eclawWebhookPort}`);
     console.log(`[bridge] public webhook: ${config.eclawWebhookUrl}/eclaw-webhook`);
@@ -163,6 +166,7 @@ export async function bootstrap(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     if (heartbeat) clearInterval(heartbeat);
+    if (runtimeHeartbeat) clearInterval(runtimeHeartbeat);
     await eclaw.unregisterCallback().catch(() => undefined);
     await codex.stop();
     process.exit(0);
@@ -192,6 +196,55 @@ export async function sendStatusHeartbeat(deps: BridgeAppDeps): Promise<boolean>
   });
   await deps.eclaw.sendMessage(state, message, { busy: true });
   return true;
+}
+
+/**
+ * card_35cb55fc (wallpaper activity-state redesign): map Codex's in-process
+ * runtime signals to the EClaw `runtimeState` contract. Pure + exported for
+ * testing. Priority mirrors how the agent is actually blocked:
+ *   - codex app-server disconnected      → "crashed"
+ *   - a pending approval (on-request)    → "stuck"  (waiting on a human)
+ *   - an active turn is running           → "busy"
+ *   - otherwise                           → "idle"
+ */
+export function computeRuntimeState(input: {
+  codexConnected: boolean;
+  approvalsPending: number;
+  activeTurn: boolean;
+}): RuntimeState {
+  if (!input.codexConnected) return "crashed";
+  if (input.approvalsPending > 0) return "stuck";
+  if (input.activeTurn) return "busy";
+  return "idle";
+}
+
+/**
+ * Lightweight runtime-state heartbeat: push the agent's REAL activity to
+ * EClaw's /api/entity/heartbeat so the live wallpaper reflects it. Distinct
+ * from sendStatusHeartbeat (which posts a chat-message status update only while
+ * a turn is active) — this fires on a short cadence regardless of turn state so
+ * "idle" is reported too, and never posts chat noise.
+ */
+export async function sendRuntimeStateHeartbeat(deps: BridgeAppDeps): Promise<boolean> {
+  const session = deps.sessionManager.status();
+  const runtimeState = computeRuntimeState({
+    codexConnected: deps.codex.status().connected,
+    approvalsPending: deps.approvalRouter.status().pending,
+    activeTurn: Boolean(session.activeTurnId || session.activeThreadId),
+  });
+  const state = await deps.stateStore.read();
+  return deps.eclaw.sendRuntimeHeartbeat(state, runtimeState);
+}
+
+export function startRuntimeStateHeartbeat(deps: BridgeAppDeps): NodeJS.Timeout | undefined {
+  if (!deps.config.bridgeRuntimeHeartbeatEnabled) return undefined;
+  const timer = setInterval(() => {
+    sendRuntimeStateHeartbeat(deps).catch((err) =>
+      console.error("[bridge] runtime heartbeat failed:", err.message),
+    );
+  }, deps.config.bridgeRuntimeHeartbeatMs);
+  timer.unref?.();
+  return timer;
 }
 
 const REDACTED_TASK_PREVIEW = "[task in progress - preview redacted to prevent secret leak]";

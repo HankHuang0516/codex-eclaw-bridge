@@ -39,6 +39,12 @@ const envSchema = z.object({
   BUSY_HEARTBEAT_DISABLED: booleanEnv.default(false),
   BRIDGE_STATUS_HEARTBEAT_ENABLED: booleanEnv.default(false),
   BRIDGE_STATUS_HEARTBEAT_MS: z.coerce.number().int().positive().default(180_000),
+  // card_35cb55fc — wallpaper activity-state redesign. Lightweight runtimeState
+  // push to /api/entity/heartbeat (distinct from the chat-message status
+  // heartbeat above). Default on; 12s cadence stays inside the backend's 45s
+  // freshness window so transitions surface within one tick.
+  BRIDGE_RUNTIME_HEARTBEAT_ENABLED: booleanEnv.default(true),
+  BRIDGE_RUNTIME_HEARTBEAT_MS: z.coerce.number().int().positive().default(12_000),
   ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY: booleanEnv.default(false),
 });
 
@@ -78,6 +84,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     bridgeRequireCallbackAuth: parsed.BRIDGE_REQUIRE_CALLBACK_AUTH,
     bridgeStatusHeartbeatEnabled: parsed.BRIDGE_STATUS_HEARTBEAT_ENABLED && !parsed.BUSY_HEARTBEAT_DISABLED,
     bridgeStatusHeartbeatMs: parsed.BRIDGE_STATUS_HEARTBEAT_MS,
+    bridgeRuntimeHeartbeatEnabled: parsed.BRIDGE_RUNTIME_HEARTBEAT_ENABLED,
+    bridgeRuntimeHeartbeatMs: parsed.BRIDGE_RUNTIME_HEARTBEAT_MS,
     eclawPreferTransformViaChannelKey: parsed.ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY,
   };
 }

@@ -6,6 +6,7 @@ import type {
   ChannelPromptPolicyResponse,
   ChannelRegisterResponse,
   EClawCard,
+  RuntimeState,
   SenderHint,
 } from "./types.js";
 
@@ -107,6 +108,32 @@ export class EClawClient {
     return this.request<ChannelPromptPolicyResponse>(`/api/channel/prompt-policy?${params.toString()}`, {
       method: "GET",
     });
+  }
+
+  /**
+   * card_35cb55fc (wallpaper activity-state redesign): forward the agent's REAL
+   * runtime activity as the optional `runtimeState` field on the EXISTING
+   * /api/entity/heartbeat endpoint, so the live wallpaper reflects what the
+   * agent is actually doing instead of inferring liveness from lastSendAt alone.
+   *
+   * Reuses the bound entity credentials (deviceId + entityId + botSecret); no
+   * new secret is introduced and botSecret is never logged. Best-effort +
+   * fail-open: returns false on any error (unbound entity / missing or slow
+   * endpoint) so the heartbeat can never disrupt message handling.
+   */
+  async sendRuntimeHeartbeat(state: BridgeState, runtimeState: RuntimeState): Promise<boolean> {
+    if (!state.deviceId || state.entityId === undefined || !state.botSecret) return false;
+    try {
+      await this.post("/api/entity/heartbeat", {
+        deviceId: state.deviceId,
+        entityId: state.entityId,
+        botSecret: state.botSecret,
+        runtimeState,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async unregisterCallback(): Promise<void> {
