@@ -21,6 +21,8 @@ const config: BridgeConfig = {
   bridgeRequireCallbackAuth: false,
   bridgeStatusHeartbeatEnabled: true,
   bridgeStatusHeartbeatMs: 180000,
+  bridgeRuntimeHeartbeatEnabled: true,
+  bridgeRuntimeHeartbeatMs: 12000,
 };
 
 describe("ApprovalRouter", () => {

@@ -26,7 +26,18 @@ export type BridgeConfig = {
   bridgeRequireCallbackAuth: boolean;
   bridgeStatusHeartbeatEnabled: boolean;
   bridgeStatusHeartbeatMs: number;
+  /** card_35cb55fc: push real runtimeState to /api/entity/heartbeat for the wallpaper. */
+  bridgeRuntimeHeartbeatEnabled: boolean;
+  bridgeRuntimeHeartbeatMs: number;
 };
+
+/**
+ * Contract value forwarded to EClaw's `POST /api/entity/heartbeat` optional
+ * `runtimeState` field, consumed by the wallpaper activity-state redesign
+ * (card_35cb55fc). The backend trusts the value only when fresh (≤45s), so the
+ * bridge re-pushes it on a short cadence (see startRuntimeStateHeartbeat).
+ */
+export type RuntimeState = "busy" | "stuck" | "crashed" | "idle";
 
 export type BridgeState = {
   deviceId?: string;
