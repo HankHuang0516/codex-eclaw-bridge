@@ -21,6 +21,9 @@ type TurnStartResponse = {
 type ActiveTurn = {
   threadId: string;
   turnId?: string;
+  senderKey?: string;
+  steeringClosed?: boolean;
+  interrupted?: boolean;
   text: string;
   startedAt: number;
   lastActivityAt: number;
@@ -34,6 +37,16 @@ const REDACTED_ACTIVE_PROMPT = "[redacted]";
 
 export class SessionManager {
   private activeTurn?: ActiveTurn;
+  // Only admission/start is serialized. Same-sender follow-ups can steer a
+  // running turn without waiting for its final answer.
+  private inboundTail: Promise<void> = Promise.resolve();
+  private steerTail: Promise<void> = Promise.resolve();
+  private queuedInboundCount = 0;
+  private queuedWorkCount = 0;
+  private steeredInboundCount = 0;
+  private steerFallbackCount = 0;
+  private lastInboundAt?: string;
+  private lastSteeredAt?: string;
   private readonly resumedThreads = new Set<string>();
   private lastTurnError?: string;
   private lastSenderHint?: SenderHint;
@@ -90,13 +103,72 @@ export class SessionManager {
   }
 
   async handleInbound(payload: EClawInboundPayload): Promise<string> {
-    // Capture the sender so the eventual outbound reply (forwarded by
-    // sessionManager via eclaw.sendMessage) can pass senderHint to
-    // /api/channel/message. The server then resolves speakTo centrally —
-    // see EClaw#2285 Phase 3a. Bots-as-sender are mapped to kind=entity;
-    // real users / system events get kind=user (no routing).
-    this.lastSenderHint = deriveSenderHint(payload);
-    return this.handleInboundOnce(payload, true);
+    this.lastInboundAt = new Date().toISOString();
+    const active = this.activeTurn;
+    const senderKey = inboundSenderKey(payload);
+    const canSteer = Boolean(active?.turnId && !active.interrupted && senderKey && active.senderKey === senderKey && this.queuedWorkCount === 0);
+    return this.enqueueInbound(payload, canSteer && active ? this.trySteer(payload, active) : undefined);
+  }
+
+  private trySteer(payload: EClawInboundPayload, active: ActiveTurn): Promise<boolean> {
+    const steering = this.steerTail.then(async () => {
+      // Completion or /interrupt can race the asynchronous admission.
+      if (this.activeTurn !== active || active.interrupted || active.steeringClosed) return false;
+      try {
+        const response = await this.codex.request<{ turnId?: string }>("turn/steer", {
+          threadId: active.threadId,
+          expectedTurnId: active.turnId,
+          input: this.buildInput(payload),
+        });
+        if (response.turnId !== active.turnId) throw new Error("Steering was not confirmed.");
+        this.steeredInboundCount += 1;
+        this.lastSteeredAt = new Date().toISOString();
+        if (this.activeTurn === active) this.markActive("turn/steer");
+        return true;
+      } catch {
+        // Once a follow-up needs FIFO fallback, do not let a later one
+        // overtake it by steering this same turn.
+        active.steeringClosed = true;
+        this.steerFallbackCount += 1;
+        return false;
+      }
+    });
+    this.steerTail = steering.then(() => undefined, () => undefined);
+    return steering;
+  }
+
+  private enqueueInbound(payload: EClawInboundPayload, steering?: Promise<boolean>): Promise<string> {
+    let resolve!: (reply: string) => void;
+    let reject!: (error: unknown) => void;
+    const reply = new Promise<string>((yes, no) => { resolve = yes; reject = no; });
+    this.queuedInboundCount += 1;
+    if (!steering) this.queuedWorkCount += 1;
+    const admission = (steering ?? Promise.resolve(false)).then((accepted) => {
+      if (accepted) {
+        this.queuedInboundCount -= 1;
+        // The original request owns delivery of the single final answer.
+        resolve("");
+      } else if (steering) {
+        this.queuedWorkCount += 1;
+      }
+      return accepted;
+    });
+    // Reserve FIFO position before the asynchronous steering response. Even a
+    // failed/late steering RPC cannot move this input behind later arrivals.
+    const work = this.inboundTail.then(async () => {
+      if (await admission) return;
+      this.queuedInboundCount -= 1;
+      this.queuedWorkCount -= 1;
+      this.lastSenderHint = deriveSenderHint(payload);
+      resolve(await this.handleInboundOnce(payload, true));
+    });
+    // One failed turn must not poison the queue for subsequent messages.
+    this.inboundTail = work.catch(reject);
+    return reply;
+  }
+
+  private buildInput(payload: EClawInboundPayload) {
+    return [{ type: "text" as const, text: formatInboundForCodex(payload), text_elements: [] }];
   }
 
   /** Last-seen sender hint, exposed for tests / status surfaces. */
@@ -105,22 +177,19 @@ export class SessionManager {
   }
 
   private async handleInboundOnce(payload: EClawInboundPayload, retryOnMissingThread: boolean): Promise<string> {
-    if (this.activeTurn) {
-      throw new Error("Codex is still processing the previous message. Use /interrupt if you want to stop it.");
-    }
     const state = await this.stateStore.read();
     const threadId = await this.ensureThread();
-    const turnPromise = this.waitForTurn(threadId);
+    const turnPromise = this.waitForTurn(threadId, inboundSenderKey(payload));
+    void turnPromise.catch(() => undefined);
     if (this.config.bridgeSendBusyUpdates) {
       // Busy updates are status-only — don't trigger speakTo via senderHint
       // even when the inbound was bot-to-bot.
       await this.eclaw.sendMessage(state, "Codex is working...", { busy: true }).catch(() => undefined);
     }
-    const input = formatInboundForCodex(payload);
     try {
       const response = await this.codex.request<TurnStartResponse>("turn/start", {
         threadId,
-        input: [{ type: "text", text: input, text_elements: [] }],
+        input: this.buildInput(payload),
         cwd: this.config.codexWorkspace,
         model: state.model ?? this.config.codexModel ?? null,
         effort: this.config.codexReasoningEffort ?? null,
@@ -129,9 +198,12 @@ export class SessionManager {
       const turnId = response.turn?.id;
       if (!turnId) throw new Error("Codex turn/start did not return a turn id.");
       const activeAfterStart = this.activeTurn as ActiveTurn | undefined;
-      if (activeAfterStart) activeAfterStart.turnId = turnId;
-      this.markActive("turn/start");
-      await this.stateStore.write({ activeTurnId: turnId });
+      if (activeAfterStart) {
+        activeAfterStart.turnId = turnId;
+        this.markActive("turn/start");
+        await this.stateStore.write({ activeTurnId: turnId });
+        if (activeAfterStart.interrupted) await this.interrupt();
+      }
       const reply = await turnPromise;
       await this.sendStopProgressUpdateIfRequired(state, reply);
       return reply;
@@ -140,6 +212,8 @@ export class SessionManager {
       if (activeAfterError) {
         clearTimeout(activeAfterError.timer);
         this.activeTurn = undefined;
+        // turn/start can reject before anyone awaits turnPromise.
+        activeAfterError.resolve("");
       }
       if (retryOnMissingThread && isMissingThreadError(err)) {
         await this.stateStore.clearThread();
@@ -152,12 +226,21 @@ export class SessionManager {
   async interrupt(): Promise<boolean> {
     const active = this.activeTurn;
     if (!active) return false;
-    clearTimeout(active.timer);
-    this.activeTurn = undefined;
-    active.resolve("");
-    await this.stateStore.write({ activeTurnId: undefined });
-    if (active.turnId) {
+    active.interrupted = true;
+    // A start RPC may still be in flight; finish cancellation once its exact
+    // id is known instead of allowing a competing queued turn to start.
+    if (!active.turnId) return true;
+    try {
       await this.codex.request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId });
+    } catch (err) {
+      if (this.activeTurn === active) active.interrupted = false;
+      throw err;
+    }
+    clearTimeout(active.timer);
+    if (this.activeTurn === active) {
+      this.activeTurn = undefined;
+      active.resolve("");
+      await this.stateStore.write({ activeTurnId: undefined });
     }
     return true;
   }
@@ -180,6 +263,11 @@ export class SessionManager {
     lastEvent?: string;
     bufferedChars: number;
     lastTurnError?: string;
+    queuedInboundCount?: number;
+    steeredInboundCount?: number;
+    steerFallbackCount?: number;
+    lastInboundAt?: string;
+    lastSteeredAt?: string;
   } {
     const now = Date.now();
     return {
@@ -192,10 +280,15 @@ export class SessionManager {
       lastEvent: this.activeTurn?.lastEvent,
       bufferedChars: this.activeTurn?.text.length ?? 0,
       lastTurnError: this.lastTurnError,
+      queuedInboundCount: this.queuedInboundCount,
+      steeredInboundCount: this.steeredInboundCount,
+      steerFallbackCount: this.steerFallbackCount,
+      lastInboundAt: this.lastInboundAt,
+      lastSteeredAt: this.lastSteeredAt,
     };
   }
 
-  private waitForTurn(threadId: string): Promise<string> {
+  private waitForTurn(threadId: string, senderKey?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.activeTurn = undefined;
@@ -204,6 +297,7 @@ export class SessionManager {
       const now = Date.now();
       this.activeTurn = {
         threadId,
+        senderKey,
         text: "",
         startedAt: now,
         lastActivityAt: now,
@@ -242,13 +336,16 @@ export class SessionManager {
     }
 
     if (message.method === "turn/completed") {
+      const active = this.activeTurn;
       const turnError = this.extractTurnError(params);
-      const text = turnError || this.extractFinalText(params) || this.activeTurn.text.trim() || "Done.";
+      const text = active.interrupted || params.turn?.status === "interrupted"
+        ? ""
+        : turnError || this.extractFinalText(params) || active.text.trim() || "Done.";
       this.lastTurnError = turnError || undefined;
-      clearTimeout(this.activeTurn.timer);
-      this.activeTurn.resolve(text);
-      this.stateStore.write({ activeTurnId: undefined }).catch(() => undefined);
+      clearTimeout(active.timer);
       this.activeTurn = undefined;
+      // A queued turn must not race the previous turn's persisted cleanup.
+      this.stateStore.write({ activeTurnId: undefined }).then(() => active.resolve(text), active.reject);
     }
   }
 
@@ -359,8 +456,8 @@ export class SessionManager {
    * captured senderHint from the most recent inbound is propagated, letting
    * the EClaw server resolve speakTo centrally (EClaw#2285 Phase 3).
    */
-  async sendCodexReply(state: BridgeState, reply: string, options: { card?: any } = {}): Promise<void> {
-    const senderHint = this.lastSenderHint;
+  async sendCodexReply(state: BridgeState, reply: string, options: { card?: any; senderHint?: SenderHint } = {}): Promise<void> {
+    const senderHint = options.senderHint ?? this.lastSenderHint;
     await this.eclaw.sendMessage(state, reply, { ...options, ...(senderHint ? { senderHint } : {}) });
   }
 }
@@ -375,6 +472,20 @@ export function requiresStopProgressTransform(compiledPrompt: string): boolean {
 
 function isMissingThreadError(err: unknown): boolean {
   return err instanceof Error && /thread not found/i.test(err.message);
+}
+
+// System notifications have independent work/routing semantics, so queue them.
+// Human follow-ups across web/mobile may steer each other on the same device.
+function inboundSenderKey(payload: EClawInboundPayload): string | undefined {
+  const scope = `${payload.deviceId}:${payload.entityId}`;
+  const from = (payload.from ?? "").toLowerCase();
+  if (payload.isBroadcast || (payload.event && payload.event !== "message") || ["system", "kanban", "kanban_notify", "org_forward"].includes(from)) return undefined;
+  if (typeof payload.fromEntityId === "number") return `${scope}:entity:${payload.fromEntityId}`;
+  if (payload.fromPublicCode) return `${scope}:code:${payload.fromPublicCode}`;
+  if (["client", "user", "web_chat", "android", "android_app", "ios", "ios_app", "local-ask"].includes(from)) {
+    return `${scope}:human`;
+  }
+  return undefined;
 }
 
 function summarizePromptForStatus(text: string): string {

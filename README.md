@@ -34,6 +34,45 @@ EClaw App / Portal
 The bridge uses EClaw's existing Channel API. No EClaw backend changes are
 required.
 
+## Messages received during a running task
+
+The app-server bridge accepts follow-up messages while Codex is working. A
+follow-up from the same human (including switching between web and mobile), or
+from the same sending bot, uses Codex's
+[`turn/steer`](https://learn.chatgpt.com/docs/app-server#steer-an-active-turn)
+with the exact active turn ID. The original task continues and sends one final
+answer. A successful insertion does not generate a duplicate final reply.
+
+Messages from a different sender, messages arriving during startup, and messages
+whose steering request is rejected wait in arrival order. Completion and
+interruption races preserve the message in that queue. Each final answer keeps
+the originating sender's routing hint; a queued bot cannot redirect a human's
+reply. Approval cards, `/status`, and `/interrupt` remain available during work.
+An explicit interrupt cancels the current turn; queued work remains available.
+
+`/health`, `/status`, and enabled status heartbeats report inserted and queued
+message counts. Queue storage is in process memory, so drain it before a service
+restart. This change applies to the app-server webhook bridge, not the separate
+polling script. It does not change sandbox or approval policy.
+
+For the busy-message incident, the local bridge also provides
+`GET /api/debug/codex-inbound`. Authenticate with the bound owner's
+`deviceId` + `deviceSecret` query parameters (verified against EClaw's owner
+authentication), or the configured callback bearer token. The response contains
+connection/activity, queue/steering counters, and pending approval count. It
+contains no message text, credentials, attachment URLs, or server log contents
+and is marked `Cache-Control: no-store`. Keep this diagnostic endpoint until the
+owner confirms the fix. Existing tunnel rules may intentionally keep it local.
+
+Regression tests (no live credentials):
+
+```bash
+npm test -- test/inbound-steering.test.ts test/inbound-debug.test.ts test/session-manager.test.ts test/server.test.ts
+```
+
+No brand icon is shipped by this headless bridge; the per-release H watermark
+check is not applicable to this service-only change.
+
 ## Requirements
 
 - Node.js 20+
