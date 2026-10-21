@@ -63,6 +63,7 @@ describe("server", () => {
       expect((d.sessionManager as any).sendCodexReply).toHaveBeenCalledWith(
         expect.anything(),
         "Codex reply",
+        { senderHint: { kind: "unknown" } },
       );
     });
   });

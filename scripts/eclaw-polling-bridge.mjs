@@ -741,7 +741,7 @@ async function pollOnce(state) {
     const selfRepair = /\bECLAW_SELF_REPAIR\s+([A-Za-z0-9_-]+)/.exec(text);
     if (selfRepair) {
       log("self_repair_directive", { inboundId: message.id, nonce: selfRepair[1] });
-      try { await sendReply(state, message, `ACK ${selfRepair[1]} self-repair: restarting`); } catch (e) { /* best effort */ }
+      try { await sendReply(state, message, `ACK ${selfRepair[1]} self-repair: restarting`); } catch { /* best effort */ }
       seen.add(message.id);
       // In-place restart; the tmux supervisor loop (while true) relaunches the poller,
       // which re-binds on startup. passive-health re-checks health afterward.

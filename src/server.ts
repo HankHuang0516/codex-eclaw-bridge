@@ -5,7 +5,8 @@ import { CodexClient } from "./codex-client.js";
 import { EClawClient } from "./eclaw-client.js";
 import { ApprovalRouter } from "./approval-router.js";
 import { parseBridgeCommand, shouldIgnoreInbound, isBridgeCommand } from "./payload.js";
-import { SessionManager } from "./session-manager.js";
+import { deriveSenderHint, SessionManager } from "./session-manager.js";
+import { inboundDebugHandler } from "./inbound-debug.js";
 import { StateStore } from "./state-store.js";
 import type { BridgeConfig, EClawCard, EClawInboundPayload, RuntimeState } from "./types.js";
 
@@ -40,6 +41,7 @@ export function createApp(deps: BridgeAppDeps): express.Express {
     });
   }
   app.use(express.json({ limit: "2mb" }));
+  app.get("/api/debug/codex-inbound", inboundDebugHandler(deps));
 
   app.get("/health", async (_req, res) => {
     const state = await deps.stateStore.read();
@@ -265,6 +267,7 @@ export function buildStatusHeartbeatMessage(status: {
     `- Last event: ${status.session.lastEvent ?? "turn started"}`,
     `- Last activity: ${status.session.lastActivityAt ?? "(unknown)"}`,
     `- Approvals: ${pendingApprovals}`,
+    `- Follow-ups: ${status.session.steeredInboundCount ?? 0} inserted, ${status.session.queuedInboundCount ?? 0} queued`,
     `- Codex connected: ${status.codex.connected}`,
   ].join("\n");
 }
@@ -309,7 +312,7 @@ export async function handleWebhookPayload(deps: BridgeAppDeps, payload: EClawIn
       // forwarded to /api/channel/message (EClaw#2285 Phase 3b). For
       // operational messages (errors), fall back to plain sendMessage so
       // we don't accidentally route them to the original sender.
-      await deps.sessionManager.sendCodexReply(await deps.stateStore.read(), reply);
+      await deps.sessionManager.sendCodexReply(await deps.stateStore.read(), reply, { senderHint: deriveSenderHint(payload) });
     }
   } catch (err: any) {
     await deps.eclaw.sendMessage(await deps.stateStore.read(), `Bridge error: ${err.message}`);
